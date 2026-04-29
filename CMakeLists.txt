@@ -25,7 +25,9 @@ list(PREPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 
 find_package(CUDAToolkit REQUIRED)
 find_package(MathDx REQUIRED)
+find_package(LAPACKE REQUIRED)
 
 string(APPEND CMAKE_CUDA_FLAGS_RELEASE " -lineinfo")
 
 add_subdirectory(src)
+add_subdirectory(tests)
