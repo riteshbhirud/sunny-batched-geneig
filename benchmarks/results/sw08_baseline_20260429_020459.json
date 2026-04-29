@@ -1,0 +1,16 @@
+{
+    "device_capability": "12.0.0",
+    "t_steven_360k_s": 34.263512484,
+    "julia_version": "1.12.6",
+    "matrix_size": 54,
+    "t_batch_b3_s": 4.000775452,
+    "t_batch_b1_s": 4.892331182,
+    "n_qpoints_steven": 360000,
+    "cuda_runtime": "12.9.0",
+    "device_name": "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
+    "t_initial_warmup_s": 51.300482076,
+    "n_atoms_magnetic_cell": 27,
+    "host": "x86_64-linux-gnu",
+    "t_batch_b2_s": 4.162866967,
+    "n_qpoints_40k_sweep": 40000
+}
