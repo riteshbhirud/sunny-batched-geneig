@@ -20,3 +20,4 @@ if [ ! -f "$_cusolverdx_header" ]; then
     return 1 2>/dev/null || exit 1
 fi
 unset _cusolverdx_header
+export CMAKE_BUILD_PARALLEL_LEVEL=2
