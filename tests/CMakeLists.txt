@@ -90,6 +90,33 @@ target_link_libraries(test_bpb_sweep_n54
         CUDA::cuda_driver
 )
 
+# Phase 3.5b BlockDim micro-bench at N=32, BPB=2.
+add_executable(test_blockdim_n32 test_blockdim_n32.cpp)
+target_link_libraries(test_blockdim_n32
+    PRIVATE
+        nvrtc_geneig
+        LAPACK::lapacke
+        CUDA::cudart
+        CUDA::cuda_driver
+)
+
+# Phase 3.5b probe-compile timing measurement (one-off).
+add_executable(probe_compile_timing probe_compile_timing.cpp)
+target_link_libraries(probe_compile_timing
+    PRIVATE
+        CUDA::nvrtc
+        CUDA::cuda_driver
+        CUDA::nvJitLink
+)
+target_compile_definitions(probe_compile_timing
+    PRIVATE
+        CUSOLVERDX_FATBIN_PATH="${MathDx_FATBIN}"
+        CUSOLVERDX_INCLUDE_DIR="${MathDx_INCLUDE_DIR}"
+        CUSOLVERDX_CUTLASS_INCLUDE_DIR="${MathDx_CUTLASS_INCLUDE_DIR}"
+        CUSOLVERDX_OVERLAY_INCLUDE_DIR="${CMAKE_SOURCE_DIR}/src/nvrtc/cusolverdx_overlay"
+        CUDA_INCLUDE_DIR="${CUDAToolkit_INCLUDE_DIRS}"
+)
+
 # Phase 3a — minimal NVRTC bug repros (heev fails, potrf succeeds).
 add_executable(repro_heev_nvrtc  repro_heev_nvrtc.cpp)
 add_executable(repro_potrf_nvrtc repro_potrf_nvrtc.cpp)

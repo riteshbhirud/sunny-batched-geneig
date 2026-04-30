@@ -98,6 +98,7 @@ struct SweepRow {
     double       max_phase      = 0.0;
     int          pass_count     = 0;
     int          total          = 0;
+    unsigned     block_dim_x    = 0;
 };
 
 SweepRow run_one(int bpb, const Fixture& fx) {
@@ -111,6 +112,7 @@ SweepRow run_one(int bpb, const Fixture& fx) {
         return r;
     }
     r.constructed = true;
+    r.block_dim_x = solver->block_dim().x;
 
     const std::size_t mat = static_cast<std::size_t>(kN) * kN;
     CUdeviceptr d_H = 0, d_S = 0, d_U = 0, d_W = 0, d_info = 0;
@@ -304,22 +306,22 @@ int main() {
 
     std::printf("\n");
     std::printf("==================== BPB sweep summary (N=54, B=%d) ====================\n", fx.B);
-    std::printf(" %3s | %13s | %12s | %11s | %11s | %s\n",
-                "BPB", "constructable", "matrices/sec", "max_eig_rel", "max_phase", "status");
-    std::printf("-----+---------------+--------------+-------------+-------------+--------\n");
+    std::printf(" %3s | %3s | %13s | %12s | %11s | %11s | %s\n",
+                "BPB", "BDx", "constructable", "matrices/sec", "max_eig_rel", "max_phase", "status");
+    std::printf("-----+-----+---------------+--------------+-------------+-------------+--------\n");
     int passed_count = 0, attempted_count = 0;
     for (const auto& r : rows) {
         if (!r.constructed) {
-            std::printf(" %3d | %13s | %12s | %11s | %11s | SKIP (%s)\n",
-                        r.bpb, "no", "-", "-", "-",
+            std::printf(" %3d | %3s | %13s | %12s | %11s | %11s | SKIP (%s)\n",
+                        r.bpb, "-", "no", "-", "-", "-",
                         r.reject_reason.substr(0, 60).c_str());
             continue;
         }
         ++attempted_count;
         const bool ok = (r.pass_count == r.total) && (r.max_eig_rel < kTolEig) && (r.max_phase < kTolVec);
         if (ok) ++passed_count;
-        std::printf(" %3d | %13s | %12.0f | %11.3e | %11.3e | %s\n",
-                    r.bpb, "yes", r.throughput_mps, r.max_eig_rel, r.max_phase,
+        std::printf(" %3d | %3u | %13s | %12.0f | %11.3e | %11.3e | %s\n",
+                    r.bpb, r.block_dim_x, "yes", r.throughput_mps, r.max_eig_rel, r.max_phase,
                     ok ? "PASS" : "FAIL");
     }
     std::printf("=========================================================================\n");

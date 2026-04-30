@@ -22,9 +22,14 @@ public:
     // `batches_per_block_request <= 0`, auto-select the largest BPB that
     // fits the device's shared-memory ceiling. Otherwise honor the explicit
     // value (and throw if it doesn't fit).
+    //
+    // `force_block_dim_x > 0` is a testing-only escape hatch that skips the
+    // probe and compiles the production kernel directly with that BlockDim.x.
+    // Use 0 (default) to let the probe pick cuSolverDx's recommendation.
     explicit NvrtcGeneigSolver(int n,
                                int device_id,
-                               int batches_per_block_request = 0);
+                               int batches_per_block_request = 0,
+                               int force_block_dim_x = 0);
     ~NvrtcGeneigSolver();
 
     NvrtcGeneigSolver(const NvrtcGeneigSolver&)            = delete;
@@ -44,9 +49,17 @@ public:
     unsigned int shared_mem_bytes()  const { return shared_mem_bytes_; }
 
 private:
-    // Build a CUmodule for (n, bpb). Throws on failure. Loads `kernel_`,
-    // `block_dim_`, `shared_mem_bytes_` from the resulting module.
-    void compile_for_(int bpb);
+    // Probe-compile a small kernel that exposes per-operator
+    // `suggested_block_dim` via `__constant__`. Returns the maximum .x value
+    // across the five operators. Throws on NVRTC compile failure (used by
+    // the auto-select loop to skip BPB candidates that don't satisfy
+    // cuSolverDx's static_assert).
+    unsigned int probe_suggested_block_dim_x_(int bpb);
+
+    // Build the production CUmodule for (n, bpb, block_dim_x). Throws on
+    // failure. Loads `kernel_`, `block_dim_`, `shared_mem_bytes_` from the
+    // resulting module.
+    void compile_production_(int bpb, unsigned int block_dim_x);
 
     int          n_                  = 0;
     int          device_id_          = 0;

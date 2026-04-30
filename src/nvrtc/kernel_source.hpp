@@ -27,6 +27,72 @@
 
 namespace nvrtc_geneig {
 
+// ---------------------------------------------------------------------------
+// Probe kernel: defines the same five solver types but exposes only their
+// suggested_block_dim values via __constant__. No execute() calls; the empty
+// `__global__ probe_kernel` is a hook for nvJitLink. NVRTC + nvJitLink + load
+// completes in roughly 5 s on the development hardware (vs ~228 s for the
+// full kernel), so we use this for cheap pre-flight to discover the per-
+// operator block-dim recommendation before the production compile.
+// ---------------------------------------------------------------------------
+inline constexpr const char* kProbeSource = R"probe(
+#include <cusolverdx.hpp>
+using namespace cusolverdx;
+
+using Cholesky = decltype(Size<M_SIZE, M_SIZE>()
+                        + Precision<double>() + Type<type::complex>()
+                        + Function<function::potrf>() + FillMode<lower>()
+                        + Arrangement<col_major>() + LeadingDimension<SOLVER_LDA>()
+                        + SM<SOLVER_SM>() + Block() + BlockDim<128>()
+                        + BatchesPerBlock<BATCHES_PER_BLOCK>());
+
+using TrsmLeft = decltype(Size<M_SIZE, M_SIZE>()
+                        + Precision<double>() + Type<type::complex>()
+                        + Function<function::trsm>() + Side<side::left>()
+                        + FillMode<lower>() + TransposeMode<non_trans>()
+                        + Diag<diag::non_unit>()
+                        + Arrangement<col_major, col_major>()
+                        + LeadingDimension<SOLVER_LDA, SOLVER_LDA>()
+                        + SM<SOLVER_SM>() + Block() + BlockDim<128>()
+                        + BatchesPerBlock<BATCHES_PER_BLOCK>());
+
+using TrsmRight = decltype(Size<M_SIZE, M_SIZE>()
+                         + Precision<double>() + Type<type::complex>()
+                         + Function<function::trsm>() + Side<side::right>()
+                         + FillMode<lower>() + TransposeMode<conj_trans>()
+                         + Diag<diag::non_unit>()
+                         + Arrangement<col_major, col_major>()
+                         + LeadingDimension<SOLVER_LDA, SOLVER_LDA>()
+                         + SM<SOLVER_SM>() + Block() + BlockDim<128>()
+                         + BatchesPerBlock<BATCHES_PER_BLOCK>());
+
+using TrsmLeftConj = decltype(Size<M_SIZE, M_SIZE>()
+                            + Precision<double>() + Type<type::complex>()
+                            + Function<function::trsm>() + Side<side::left>()
+                            + FillMode<lower>() + TransposeMode<conj_trans>()
+                            + Diag<diag::non_unit>()
+                            + Arrangement<col_major, col_major>()
+                            + LeadingDimension<SOLVER_LDA, SOLVER_LDA>()
+                            + SM<SOLVER_SM>() + Block() + BlockDim<128>()
+                            + BatchesPerBlock<BATCHES_PER_BLOCK>());
+
+using Heev = decltype(Size<M_SIZE>()
+                    + Precision<double>() + Type<type::complex>()
+                    + Function<function::heev>() + FillMode<lower>()
+                    + Arrangement<col_major>() + LeadingDimension<SOLVER_LDA>()
+                    + Job<job::overwrite_vectors>()
+                    + SM<SOLVER_SM>() + Block() + BlockDim<128>()
+                    + BatchesPerBlock<BATCHES_PER_BLOCK>());
+
+__constant__ dim3 cholesky_suggested_block_dim     = Cholesky::suggested_block_dim;
+__constant__ dim3 trsm_left_suggested_block_dim    = TrsmLeft::suggested_block_dim;
+__constant__ dim3 trsm_right_suggested_block_dim   = TrsmRight::suggested_block_dim;
+__constant__ dim3 trsm_lc_suggested_block_dim      = TrsmLeftConj::suggested_block_dim;
+__constant__ dim3 heev_suggested_block_dim         = Heev::suggested_block_dim;
+
+extern "C" __global__ void probe_kernel() {}
+)probe";
+
 inline constexpr const char* kKernelSource = R"kernel(
 #include <cusolverdx.hpp>
 
@@ -44,7 +110,7 @@ using Cholesky = decltype(Size<M_SIZE, M_SIZE>()
                         + LeadingDimension<SOLVER_LDA>()
                         + SM<SOLVER_SM>()
                         + Block()
-                        + BlockDim<128>()
+                        + BlockDim<BLOCK_DIM_X>()
                         + BatchesPerBlock<BATCHES_PER_BLOCK>());
 
 using TrsmLeft = decltype(Size<M_SIZE, M_SIZE>()
@@ -59,7 +125,7 @@ using TrsmLeft = decltype(Size<M_SIZE, M_SIZE>()
                         + LeadingDimension<SOLVER_LDA, SOLVER_LDA>()
                         + SM<SOLVER_SM>()
                         + Block()
-                        + BlockDim<128>()
+                        + BlockDim<BLOCK_DIM_X>()
                         + BatchesPerBlock<BATCHES_PER_BLOCK>());
 
 using TrsmRight = decltype(Size<M_SIZE, M_SIZE>()
@@ -74,7 +140,7 @@ using TrsmRight = decltype(Size<M_SIZE, M_SIZE>()
                          + LeadingDimension<SOLVER_LDA, SOLVER_LDA>()
                          + SM<SOLVER_SM>()
                          + Block()
-                         + BlockDim<128>()
+                         + BlockDim<BLOCK_DIM_X>()
                          + BatchesPerBlock<BATCHES_PER_BLOCK>());
 
 using TrsmLeftConj = decltype(Size<M_SIZE, M_SIZE>()
@@ -89,7 +155,7 @@ using TrsmLeftConj = decltype(Size<M_SIZE, M_SIZE>()
                             + LeadingDimension<SOLVER_LDA, SOLVER_LDA>()
                             + SM<SOLVER_SM>()
                             + Block()
-                            + BlockDim<128>()
+                            + BlockDim<BLOCK_DIM_X>()
                             + BatchesPerBlock<BATCHES_PER_BLOCK>());
 
 using Heev = decltype(Size<M_SIZE>()
@@ -102,7 +168,7 @@ using Heev = decltype(Size<M_SIZE>()
                     + Job<job::overwrite_vectors>()
                     + SM<SOLVER_SM>()
                     + Block()
-                    + BlockDim<128>()
+                    + BlockDim<BLOCK_DIM_X>()
                     + BatchesPerBlock<BATCHES_PER_BLOCK>());
 
 using DType      = typename Cholesky::a_data_type;
