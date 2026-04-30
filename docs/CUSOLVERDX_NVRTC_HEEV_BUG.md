@@ -128,3 +128,29 @@ When cuSolverDx ships a fix, the hybrid can collapse back to a single
 NVRTC kernel — the kernel-source surgery is local to
 [`src/nvrtc/kernel_source.hpp`](../src/nvrtc/kernel_source.hpp) and
 [`src/nvrtc/nvrtc_solver.cpp`](../src/nvrtc/nvrtc_solver.cpp).
+
+## Related observation: nvJitLink performance
+
+Independently of the heev bug, we measured nvJitLink wall time during
+the construction of `NvrtcGeneigSolver`. For a 5 MB LTO IR (potrf +
+2× trsm at N=54, complex<double>) linked against the cuSolverDx 25.12
+fatbin on an RTX 5070 Ti Laptop GPU (sm_120, CUDA 12.8):
+
+| Phase           | Cold (ms) | Warm (ms) |
+|-----------------|-----------|-----------|
+| ctx-init        | 2,858     | 0         |
+| nvrtcCompile    | 2,817     | 1,380     |
+| GetLTOIR        | 1         | 0         |
+| nvJitLink       | 79,452    | 72,521    |
+| cubin load      | 213       | 203       |
+| TOTAL           | 85,343    | 74,103    |
+
+nvJitLink consumes 93-98% of total compile time. Output cubin is 27 MB.
+This may indicate that nvJitLink is performing LTO across the entire
+cuSolverDx fatbin even when only three primitives are referenced from
+the LTO IR. NVIDIA's `nvrtc_potrs.cpp` example (which uses one primitive)
+reportedly compiles in seconds.
+
+This is a separate observation from the heev declaration-order bug;
+it does not block correctness. Mitigations like cubin-on-disk caching
+are deferred to a later phase.
