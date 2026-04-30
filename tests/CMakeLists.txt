@@ -81,6 +81,15 @@ target_link_libraries(test_nvrtc_multiN
         CUDA::cuda_driver
 )
 
+# Phase 3.5a — BatchesPerBlock sweep at N=54.
+add_executable(test_bpb_sweep_n54 test_bpb_sweep_n54.cpp)
+target_link_libraries(test_bpb_sweep_n54
+    PRIVATE
+        nvrtc_geneig
+        CUDA::cudart
+        CUDA::cuda_driver
+)
+
 # Phase 3a — minimal NVRTC bug repros (heev fails, potrf succeeds).
 add_executable(repro_heev_nvrtc  repro_heev_nvrtc.cpp)
 add_executable(repro_potrf_nvrtc repro_potrf_nvrtc.cpp)

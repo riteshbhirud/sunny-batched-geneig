@@ -1,14 +1,15 @@
-// Phase 3a — implementation of NvrtcGeneigSolver (reduce half).
+// Phase 3.5a — implementation of NvrtcGeneigSolver with BatchesPerBlock support.
 //
-// The constructor walks the standard cuSolverDx-NVRTC pipeline:
+// The constructor walks the cuSolverDx-NVRTC pipeline:
 //   nvrtcCreateProgram → nvrtcCompileProgram (with -dlto) → nvrtcGetLTOIR
 //   → nvJitLinkCreate → nvJitLinkAddFile(libcusolverdx.fatbin)
 //   → nvJitLinkAddData(LTOIR) → nvJitLinkComplete → nvJitLinkGetLinkedCubin
 //   → cuModuleLoadDataEx → cuModuleGetFunction.
 //
-// The primary device context is acquired via cuDevicePrimaryCtxRetain so this
-// path coexists with runtime-API allocations (cudaMalloc et al.) on the same
-// device.
+// BatchesPerBlock auto-selection: try BPB candidates in {16, 8, 4, 2, 1}.
+// For each candidate that hasn't been ruled out by a quick sanity check, we
+// actually compile and read back `solver_shared_memory_size`. The first one
+// whose reported size fits within (device_max_smem - 2 KB) is accepted.
 
 #include "nvrtc_solver.hpp"
 #include "kernel_source.hpp"
@@ -73,53 +74,40 @@ void throw_nvjitlink(nvJitLinkHandle linker, nvJitLinkResult r, const char* call
     if (_r != NVJITLINK_SUCCESS) throw_nvjitlink((linker), _r, #expr);   \
 } while (0)
 
+// No artificial safety margin — cuFuncSetAttribute is the real gate.
+// Earlier we tried 2 KB margin which incorrectly rejected the N=54 BPB=1
+// case (shared_mem=99712 vs device_max=101376) on a config that we'd
+// already proven works in Phase 3b.
+constexpr int kSafetyMarginBytes = 0;
+
 }  // namespace
 
-NvrtcGeneigSolver::NvrtcGeneigSolver(int n, int device_id)
-    : n_(n), device_id_(device_id) {
+void NvrtcGeneigSolver::compile_for_(int bpb) {
     using clk = std::chrono::steady_clock;
-    auto t_ctor = clk::now();
+    auto t_start = clk::now();
     auto ms_since = [](clk::time_point a, clk::time_point b) {
         return std::chrono::duration<double, std::milli>(b - a).count();
     };
 
-    CU_CHECK(cuInit(0));
     CUdevice cu_device;
     CU_CHECK(cuDeviceGet(&cu_device, device_id_));
-    CU_CHECK(cuDevicePrimaryCtxRetain(&context_, cu_device));
-    CU_CHECK(cuCtxSetCurrent(context_));
-
     int major = 0, minor = 0;
     CU_CHECK(cuDeviceGetAttribute(&major,
         CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, cu_device));
     CU_CHECK(cuDeviceGetAttribute(&minor,
         CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, cu_device));
     const int arch = major * 10 + minor;
-    auto t_after_ctx = clk::now();
 
-    // ---- NVRTC: kernel source → LTO IR ------------------------------------
+    // ---- NVRTC: kernel source → LTO IR ----
     nvrtcProgram program = nullptr;
-    NVRTC_CHECK(nvrtcCreateProgram(&program,
-                                   nvrtc_geneig::kKernelSource,
-                                   "geneig_full_kernel.cu",
-                                   /*numHeaders=*/0,
-                                   /*headers=*/nullptr,
-                                   /*includeNames=*/nullptr));
+    NVRTC_CHECK(nvrtcCreateProgram(&program, nvrtc_geneig::kKernelSource,
+        "geneig_full_kernel.cu", 0, nullptr, nullptr));
 
-    const std::string m_size_def    = "-DM_SIZE="     + std::to_string(n_);
-    const std::string lda_def       = "-DSOLVER_LDA=" + std::to_string(n_);
-    // SOLVER_SM is the tuning-database lookup tag for cuSolverDx templates,
-    // not a runtime architecture target. SM<800> = Ampere (~164 KB dynamic
-    // shared memory per block opt-in) so the cuSolverDx static_assert that
-    // gates "problem fits in shared memory" passes for larger N than the
-    // V100/SM<700> 96 KB ceiling would allow. The `--gpu-architecture=sm_NN`
-    // flag below selects the actual runtime arch via nvJitLink + the
-    // cuSolverDx fatbin.
+    const std::string m_size_def    = "-DM_SIZE="            + std::to_string(n_);
+    const std::string lda_def       = "-DSOLVER_LDA="        + std::to_string(n_);
     const std::string sm_def        = "-DSOLVER_SM=800";
+    const std::string bpb_def       = "-DBATCHES_PER_BLOCK=" + std::to_string(bpb);
     const std::string arch_opt      = "--gpu-architecture=sm_" + std::to_string(arch);
-    // The overlay path MUST come before the upstream cusolverdx include path
-    // so the patched solver_execution.hpp shadows the upstream copy. See
-    // src/nvrtc/cusolverdx_overlay/cusolverdx/detail/solver_execution.hpp.
     const std::string overlay_inc   = std::string("--include-path=") + CUSOLVERDX_OVERLAY_INCLUDE_DIR;
     const std::string cusolver_inc  = std::string("--include-path=") + CUSOLVERDX_INCLUDE_DIR;
     const std::string cutlass_inc   = std::string("--include-path=") + CUSOLVERDX_CUTLASS_INCLUDE_DIR;
@@ -133,8 +121,9 @@ NvrtcGeneigSolver::NvrtcGeneigSolver(int n, int device_id)
         m_size_def.c_str(),
         lda_def.c_str(),
         sm_def.c_str(),
+        bpb_def.c_str(),
         arch_opt.c_str(),
-        overlay_inc.c_str(),    // overlay first — shadows upstream
+        overlay_inc.c_str(),
         cusolver_inc.c_str(),
         cutlass_inc.c_str(),
         cuda_inc.c_str(),
@@ -150,9 +139,9 @@ NvrtcGeneigSolver::NvrtcGeneigSolver(int n, int device_id)
         std::string log(log_size, '\0');
         if (log_size > 0) nvrtcGetProgramLog(program, &log[0]);
         nvrtcDestroyProgram(&program);
-        cuDevicePrimaryCtxRelease(cu_device);
         std::ostringstream oss;
-        oss << "NVRTC compile failed: " << nvrtcGetErrorString(compile_res) << "\n" << log;
+        oss << "NVRTC compile failed (n=" << n_ << ", bpb=" << bpb << "): "
+            << nvrtcGetErrorString(compile_res) << "\n" << log;
         throw std::runtime_error(oss.str());
     }
 
@@ -163,13 +152,11 @@ NvrtcGeneigSolver::NvrtcGeneigSolver(int n, int device_id)
     NVRTC_CHECK(nvrtcDestroyProgram(&program));
     auto t_after_ltoir = clk::now();
 
-    // ---- nvJitLink: LTO IR + cuSolverDx fatbin → cubin --------------------
+    // ---- nvJitLink: LTO IR + cuSolverDx fatbin → cubin ----
     const std::string nvjit_arch = "-arch=sm_" + std::to_string(arch);
     const char* link_opts[] = { "-lto", nvjit_arch.c_str() };
-
     nvJitLinkHandle linker = nullptr;
     NVJITLINK_CHECK(nullptr, nvJitLinkCreate(&linker, 2, link_opts));
-
     NVJITLINK_CHECK(linker, nvJitLinkAddFile(linker,
         NVJITLINK_INPUT_FATBIN, CUSOLVERDX_FATBIN_PATH));
     NVJITLINK_CHECK(linker, nvJitLinkAddData(linker,
@@ -183,49 +170,103 @@ NvrtcGeneigSolver::NvrtcGeneigSolver(int n, int device_id)
     NVJITLINK_CHECK(linker, nvJitLinkGetLinkedCubin(linker, cubin.data()));
     nvJitLinkDestroy(&linker);
 
-    // ---- Module load + symbol resolution ---------------------------------
+    // ---- Module load + symbol resolution ----
+    if (module_) { cuModuleUnload(module_); module_ = nullptr; }
     CU_CHECK(cuModuleLoadDataEx(&module_, cubin.data(), 0, nullptr, nullptr));
     CU_CHECK(cuModuleGetFunction(&kernel_, module_, "geneig_full_kernel"));
-    auto t_after_module_load = clk::now();
 
     {
         CUdeviceptr ptr; std::size_t size;
         CU_CHECK(cuModuleGetGlobal(&ptr, &size, module_, "solver_block_dim"));
-        if (size != sizeof(dim3)) {
-            throw std::runtime_error("solver_block_dim has unexpected size");
-        }
+        if (size != sizeof(dim3)) throw std::runtime_error("solver_block_dim has unexpected size");
         CU_CHECK(cuMemcpyDtoH(&block_dim_, ptr, size));
     }
     {
         CUdeviceptr ptr; std::size_t size;
         CU_CHECK(cuModuleGetGlobal(&ptr, &size, module_, "solver_shared_memory_size"));
-        if (size != sizeof(unsigned int)) {
-            throw std::runtime_error("solver_shared_memory_size has unexpected size");
-        }
+        if (size != sizeof(unsigned int)) throw std::runtime_error("solver_shared_memory_size has unexpected size");
         CU_CHECK(cuMemcpyDtoH(&shared_mem_bytes_, ptr, size));
+    }
+    auto t_done = clk::now();
+
+    std::fprintf(stderr,
+        "[NvrtcGeneigSolver] compile (n=%d bpb=%d): %.0f ms total "
+        "(nvrtc %.0f, nvJitLink %.0f); shared_mem=%u, lto=%zu, cubin=%zu\n",
+        n_, bpb,
+        ms_since(t_start, t_done),
+        ms_since(t_before_compile, t_after_compile),
+        ms_since(t_after_ltoir, t_after_link),
+        shared_mem_bytes_, lto_size, cubin_size);
+}
+
+NvrtcGeneigSolver::NvrtcGeneigSolver(int n,
+                                     int device_id,
+                                     int batches_per_block_request)
+    : n_(n), device_id_(device_id) {
+    CU_CHECK(cuInit(0));
+    CUdevice cu_device;
+    CU_CHECK(cuDeviceGet(&cu_device, device_id_));
+    CU_CHECK(cuDevicePrimaryCtxRetain(&context_, cu_device));
+    CU_CHECK(cuCtxSetCurrent(context_));
+
+    CU_CHECK(cuDeviceGetAttribute(&device_max_smem_,
+        CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, cu_device));
+
+    const int budget = device_max_smem_ - kSafetyMarginBytes;
+    if (budget <= 0) {
+        std::ostringstream oss;
+        oss << "device max dynamic shared memory (" << device_max_smem_
+            << " B) is below safety margin (" << kSafetyMarginBytes << " B)";
+        throw std::runtime_error(oss.str());
+    }
+
+    if (batches_per_block_request > 0) {
+        // Explicit override: compile and verify it fits.
+        compile_for_(batches_per_block_request);
+        if (static_cast<int>(shared_mem_bytes_) > budget) {
+            std::ostringstream oss;
+            oss << "explicit BPB=" << batches_per_block_request
+                << " requires " << shared_mem_bytes_
+                << " B shared memory, exceeds device budget "
+                << budget << " B (max " << device_max_smem_
+                << ", margin " << kSafetyMarginBytes << ")";
+            throw std::runtime_error(oss.str());
+        }
+        batches_per_block_ = batches_per_block_request;
+    } else {
+        // Auto-select: try BPB candidates from largest to smallest.
+        const int candidates[] = {16, 8, 4, 2, 1};
+        bool ok = false;
+        for (int cand : candidates) {
+            try {
+                compile_for_(cand);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr,
+                    "[NvrtcGeneigSolver] BPB=%d compile rejected: %s\n",
+                    cand, e.what());
+                continue;
+            }
+            if (static_cast<int>(shared_mem_bytes_) <= budget) {
+                batches_per_block_ = cand;
+                ok = true;
+                break;
+            }
+            std::fprintf(stderr,
+                "[NvrtcGeneigSolver] BPB=%d shared_mem=%u > budget=%d, trying smaller\n",
+                cand, shared_mem_bytes_, budget);
+        }
+        if (!ok) {
+            std::ostringstream oss;
+            oss << "no BPB candidate in {16,8,4,2,1} fits device budget "
+                << budget << " B (max " << device_max_smem_ << " B). "
+                << "Last attempted BPB shared_mem=" << shared_mem_bytes_;
+            throw std::runtime_error(oss.str());
+        }
     }
 
     CU_CHECK(cuFuncSetAttribute(kernel_,
         CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
         static_cast<int>(shared_mem_bytes_)));
-    auto t_done = clk::now();
-
-    std::fprintf(stderr,
-        "[NvrtcGeneigSolver] phase timings (ms):\n"
-        "  ctx-init           : %8.1f\n"
-        "  nvrtcCompile       : %8.1f  (lto_size=%zu)\n"
-        "  GetLTOIR           : %8.1f\n"
-        "  nvJitLink (link)   : %8.1f\n"
-        "  cubin load+symbols : %8.1f  (cubin_size=%zu)\n"
-        "  introspection      : %8.1f\n"
-        "  TOTAL              : %8.1f\n",
-        ms_since(t_ctor,             t_after_ctx),
-        ms_since(t_before_compile,   t_after_compile),     lto_size,
-        ms_since(t_after_compile,    t_after_ltoir),
-        ms_since(t_after_ltoir,      t_after_link),
-        ms_since(t_after_link,       t_after_module_load), cubin_size,
-        ms_since(t_after_module_load,t_done),
-        ms_since(t_ctor,             t_done));
 }
 
 NvrtcGeneigSolver::~NvrtcGeneigSolver() {
@@ -247,8 +288,10 @@ void NvrtcGeneigSolver::launch(CUdeviceptr d_H, CUdeviceptr d_S,
     if (batch_size <= 0) return;
     int local_bs = batch_size;
     void* args[] = { &d_H, &d_S, &d_W, &d_U, &d_info, &local_bs };
+    const unsigned grid =
+        static_cast<unsigned>((batch_size + batches_per_block_ - 1) / batches_per_block_);
     CU_CHECK(cuLaunchKernel(kernel_,
-                            /*grid:*/ static_cast<unsigned>(batch_size), 1, 1,
+                            /*grid:*/ grid, 1, 1,
                             /*block:*/ block_dim_.x, block_dim_.y, block_dim_.z,
                             shared_mem_bytes_, stream, args, nullptr));
 }

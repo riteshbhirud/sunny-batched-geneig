@@ -196,6 +196,7 @@ struct NRow {
     std::string  skip_reason;
     double       cold_compile_ms = 0.0;
     unsigned     shared_mem      = 0;
+    int          bpb             = 0;
     PerFixtureResult random;
     PerFixtureResult nearid;
 };
@@ -237,8 +238,9 @@ int main() {
         }
 
         row.shared_mem = solver->shared_mem_bytes();
-        std::printf("  cold compile: %.0f ms, shared_mem=%u bytes (device max=%d)\n",
-                    row.cold_compile_ms, row.shared_mem, max_smem_optin);
+        row.bpb        = solver->batches_per_block();
+        std::printf("  cold compile: %.0f ms, BPB=%d, shared_mem=%u bytes (device max=%d)\n",
+                    row.cold_compile_ms, row.bpb, row.shared_mem, max_smem_optin);
 
         if (static_cast<int>(row.shared_mem) > max_smem_optin) {
             row.skipped     = true;
@@ -269,15 +271,15 @@ int main() {
     // Summary table.
     // -----------------------------------------------------------
     std::printf("\n");
-    std::printf("==================== Phase 3b multi-N summary ====================\n");
-    std::printf(" %3s | %5s | %9s | %9s | %9s | %9s | %s\n",
-                "N", "smem", "cold_ms", "rand_eig", "rand_phs", "near_phs", "status");
-    std::printf("-----+-------+-----------+-----------+-----------+-----------+--------\n");
+    std::printf("==================== Phase 3.5a multi-N summary ====================\n");
+    std::printf(" %3s | %3s | %5s | %9s | %9s | %9s | %9s | %s\n",
+                "N", "BPB", "smem", "cold_ms", "rand_eig", "rand_phs", "near_phs", "status");
+    std::printf("-----+-----+-------+-----------+-----------+-----------+-----------+--------\n");
     int total_run_pairs = 0, total_pass_pairs = 0;
     for (const auto& r : rows) {
         if (r.skipped) {
-            std::printf(" %3d | %5s | %9s | %9s | %9s | %9s | SKIP (%s)\n",
-                        r.n, "-", "-", "-", "-", "-", r.skip_reason.c_str());
+            std::printf(" %3d | %3s | %5s | %9s | %9s | %9s | %9s | SKIP (%s)\n",
+                        r.n, "-", "-", "-", "-", "-", "-", r.skip_reason.c_str());
             continue;
         }
         const bool rand_ok = (r.random.pass_count == r.random.total);
@@ -285,8 +287,8 @@ int main() {
         total_run_pairs += 2;
         if (rand_ok) ++total_pass_pairs;
         if (near_ok) ++total_pass_pairs;
-        std::printf(" %3d | %5u | %9.0f | %9.2e | %9.2e | %9.2e | %s\n",
-                    r.n, r.shared_mem, r.cold_compile_ms,
+        std::printf(" %3d | %3d | %5u | %9.0f | %9.2e | %9.2e | %9.2e | %s\n",
+                    r.n, r.bpb, r.shared_mem, r.cold_compile_ms,
                     r.random.max_eig_rel, r.random.max_phase_err, r.nearid.max_phase_err,
                     (rand_ok && near_ok) ? "PASS" : "FAIL");
     }
