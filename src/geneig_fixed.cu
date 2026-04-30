@@ -495,3 +495,98 @@ extern "C" {
 unsigned int geneig_full_n54_batched_block_dim_x()      { return Cholesky54::block_dim.x; }
 unsigned int geneig_full_n54_batched_shared_mem_bytes() { return kReduceEigSmem; }
 }
+
+// ===========================================================================
+// Phase 3a — finishing kernel for the hybrid NVRTC + static pipeline.
+//
+// Inputs (computed by the NVRTC `geneig_reduce_kernel`):
+//   L_in : Cholesky factor L of S, lower triangular, strict upper zeroed.
+//   M_in : reduced matrix L^{-1} H L^{-H} (full Hermitian; only lower
+//          triangle is read by heev under FillMode<lower>).
+// Outputs:
+//   W_out : real eigenvalues of M (= eigenvalues of the generalised problem).
+//   U_out : generalised eigenvectors u_i (S-orthonormal).
+//
+// Pipeline: heev(M) → V; trsm_left_conj(L, V) → U = L^{-H} V.
+// Shared-memory layout matches geneig_reduce_eig_n54_kernel: As holds L
+// throughout (needed by the back-transform trsm), Bs holds M → V → U, with
+// the heev workspace and lambda_s tucked into Heev54::shared_memory_size.
+// ===========================================================================
+
+__global__ __launch_bounds__(Cholesky54::max_threads_per_block)
+void geneig_finish_n54_kernel(const cuDoubleComplex* __restrict__ L_in,
+                              const cuDoubleComplex* __restrict__ M_in,
+                              double*                __restrict__ W_out,
+                              cuDoubleComplex*       __restrict__ U_out,
+                              int*                   __restrict__ info_out,
+                              int                                 batch_size) {
+    const int b = blockIdx.x;
+    if (b >= batch_size) return;
+
+    const std::size_t mat_stride = static_cast<std::size_t>(kN) * kLDA;
+    const std::size_t w_stride   = static_cast<std::size_t>(kN);
+
+    const cuDoubleComplex* L_b = L_in  + mat_stride * b;
+    const cuDoubleComplex* M_b = M_in  + mat_stride * b;
+    cuDoubleComplex*       U_b = U_out + mat_stride * b;
+    double*                W_b = W_out + w_stride   * b;
+    int*                   info_b = info_out + b;
+
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+
+    constexpr unsigned int kBsOffset       = Cholesky54::shared_memory_size;
+    constexpr unsigned int kLambdaOffset   = kBsOffset + sizeof(DType) * kN * kLDA;
+    constexpr unsigned int kLambdaBytes    = sizeof(PType) * kN;
+    constexpr unsigned int kWorkspaceOffset =
+        ((kLambdaOffset + kLambdaBytes) + alignof(DType) - 1) & ~(alignof(DType) - 1);
+
+    DType* As           = reinterpret_cast<DType*>(smem_raw);
+    DType* Bs           = reinterpret_cast<DType*>(smem_raw + kBsOffset);
+    PType* lambda_s     = reinterpret_cast<PType*>(smem_raw + kLambdaOffset);
+    DType* workspace_s  = reinterpret_cast<DType*>(smem_raw + kWorkspaceOffset);
+
+    const DType* L_typed = reinterpret_cast<const DType*>(L_b);
+    const DType* M_typed = reinterpret_cast<const DType*>(M_b);
+    for (int idx = threadIdx.x; idx < kN * kLDA; idx += blockDim.x) {
+        As[idx] = L_typed[idx];
+        Bs[idx] = M_typed[idx];
+    }
+    __syncthreads();
+
+    Heev54().execute(Bs, kLDA, lambda_s, workspace_s,
+                     reinterpret_cast<StatusType*>(info_b));
+    __syncthreads();                                      // Bs = V (eigvecs of M)
+    Trsm54LeftConj().execute(As, kLDA, Bs, kLDA);        // Bs ← L^{-H} V = U
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < kN; i += blockDim.x)
+        W_b[i] = lambda_s[i];
+    DType* U_typed = reinterpret_cast<DType*>(U_b);
+    for (int idx = threadIdx.x; idx < kN * kLDA; idx += blockDim.x)
+        U_typed[idx] = Bs[idx];
+}
+
+extern "C" void geneig_finish_n54_launch(const cuDoubleComplex* d_L,
+                                         const cuDoubleComplex* d_M,
+                                         double*                d_W,
+                                         cuDoubleComplex*       d_U,
+                                         int*                   d_info,
+                                         int                    batch_size,
+                                         cudaStream_t           stream) {
+    static bool attr_set = false;
+    if (!attr_set) {
+        cudaFuncSetAttribute(geneig_finish_n54_kernel,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             kReduceEigSmem);
+        attr_set = true;
+    }
+    if (batch_size <= 0) return;
+    geneig_finish_n54_kernel<<<batch_size, Cholesky54::block_dim,
+                               kReduceEigSmem, stream>>>(
+        d_L, d_M, d_W, d_U, d_info, batch_size);
+}
+
+extern "C" {
+unsigned int geneig_finish_n54_block_dim_x()      { return Cholesky54::block_dim.x; }
+unsigned int geneig_finish_n54_shared_mem_bytes() { return kReduceEigSmem; }
+}

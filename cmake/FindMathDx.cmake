@@ -73,9 +73,10 @@ if(MathDx_FOUND AND NOT TARGET MathDx::cusolverdx)
     )
 endif()
 
+# MathDx_FATBIN is intentionally not advanced — Phase 3 NVRTC consumers need
+# its absolute path injected as a compile definition.
 mark_as_advanced(
     MathDx_INCLUDE_DIR
     MathDx_CUTLASS_INCLUDE_DIR
     MathDx_LIBRARY
-    MathDx_FATBIN
 )
