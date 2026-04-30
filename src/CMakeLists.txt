@@ -49,6 +49,7 @@ target_compile_definitions(nvrtc_geneig
         CUSOLVERDX_FATBIN_PATH="${MathDx_FATBIN}"
         CUSOLVERDX_INCLUDE_DIR="${MathDx_INCLUDE_DIR}"
         CUSOLVERDX_CUTLASS_INCLUDE_DIR="${MathDx_CUTLASS_INCLUDE_DIR}"
+        CUSOLVERDX_OVERLAY_INCLUDE_DIR="${CMAKE_SOURCE_DIR}/src/nvrtc/cusolverdx_overlay"
         CUDA_INCLUDE_DIR="${CUDAToolkit_INCLUDE_DIRS}"
 )
 

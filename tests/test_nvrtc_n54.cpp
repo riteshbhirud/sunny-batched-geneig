@@ -1,20 +1,11 @@
-// Phase 3a test — hybrid NVRTC + static pipeline for the generalized
-// eigenvalue solve.
+// Phase 3b regression test — unified NVRTC pipeline at N=54 against the
+// random-S fixture. Kept as a fast single-N smoke check; the broader multi-N
+// validation lives in test_nvrtc_multiN.cpp.
 //
-// Pipeline:
-//   1. NVRTC-compiled geneig_reduce_kernel  →  L (Cholesky of S) and
-//                                              M (= L^{-1} H L^{-H})
-//   2. Statically-compiled geneig_finish_n54_kernel  →  Λ and U
-//
-// Why the split: cuSolverDx 25.12 + NVRTC fails to compile heev. See
-// docs/CUSOLVERDX_NVRTC_HEEV_BUG.md and tests/repro_heev_nvrtc.cpp.
-//
-// All device-memory operations use the CUDA driver API to match the NVRTC
-// path's CUmodule/CUfunction lifecycle. The static finishing-kernel launch
-// wrapper uses pointer types — we cast the CUdeviceptr buffers since both
-// the driver-API allocator (cuMemAlloc) and the runtime-API allocator
-// (cudaMalloc) use the same primary context and produce equivalent device
-// addresses.
+// The hybrid two-kernel split that Phase 3a used is gone in 3b: with the
+// cuSolverDx header overlay (src/nvrtc/cusolverdx_overlay/) the heev path
+// instantiates under NVRTC and the kernel runs all five stages in one
+// launch. See docs/CUSOLVERDX_NVRTC_HEEV_BUG.md.
 
 #include <cuComplex.h>
 #include <cuda.h>
@@ -31,16 +22,6 @@
 #include <cstring>
 #include <fstream>
 #include <vector>
-
-// Static finishing-kernel wrapper exposed by libgeneig_fixed.a.
-typedef struct CUstream_st* cudaStream_t_compat;
-extern "C" void geneig_finish_n54_launch(const cuDoubleComplex* d_L,
-                                         const cuDoubleComplex* d_M,
-                                         double*                d_W,
-                                         cuDoubleComplex*       d_U,
-                                         int*                   d_info,
-                                         int                    batch_size,
-                                         cudaStream_t_compat    stream);
 
 using cdouble = std::complex<double>;
 
@@ -108,26 +89,22 @@ void mul_S_v(const cdouble* S, const cdouble* v, cdouble* Sv, int n) {
 }  // namespace
 
 int main() {
-    // --- Cold compile ----------------------------------------------------
     auto t0 = std::chrono::steady_clock::now();
-    NvrtcGeneigSolver solver(0);
+    NvrtcGeneigSolver solver(kN, /*device_id=*/0);
     auto t1 = std::chrono::steady_clock::now();
     const double cold_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     std::printf("cold NVRTC compile: %.1f ms\n", cold_ms);
-    std::printf("reduce kernel block_dim.x=%u, shared_mem_bytes=%u\n",
-                solver.block_dim().x, solver.shared_mem_bytes());
+    std::printf("kernel block_dim.x=%u, shared_mem_bytes=%u, matrix_size=%d\n",
+                solver.block_dim().x, solver.shared_mem_bytes(), solver.matrix_size());
 
-    // --- Fixture validation ----------------------------------------------
     const Fixture fx = load_fixture("tests/data/n54_b8_s42_random.bin");
     std::printf("loaded fixture: B=%d, N=%d\n", fx.B, kN);
 
     const std::size_t mat = static_cast<std::size_t>(kN) * kN;
 
-    CUdeviceptr d_H = 0, d_S = 0, d_L = 0, d_M = 0, d_U = 0, d_W = 0, d_info = 0;
+    CUdeviceptr d_H = 0, d_S = 0, d_U = 0, d_W = 0, d_info = 0;
     CU_CHECK(cuMemAlloc(&d_H,    mat * sizeof(cuDoubleComplex)));
     CU_CHECK(cuMemAlloc(&d_S,    mat * sizeof(cuDoubleComplex)));
-    CU_CHECK(cuMemAlloc(&d_L,    mat * sizeof(cuDoubleComplex)));
-    CU_CHECK(cuMemAlloc(&d_M,    mat * sizeof(cuDoubleComplex)));
     CU_CHECK(cuMemAlloc(&d_U,    mat * sizeof(cuDoubleComplex)));
     CU_CHECK(cuMemAlloc(&d_W,    static_cast<std::size_t>(kN) * sizeof(double)));
     CU_CHECK(cuMemAlloc(&d_info, sizeof(int)));
@@ -149,17 +126,8 @@ int main() {
         CU_CHECK(cuMemcpyHtoD(d_S, S_b, mat * sizeof(cuDoubleComplex)));
         CU_CHECK(cuMemsetD8(d_info, 0, sizeof(int)));
 
-        // Stage 1 (NVRTC): produce L and M.
-        solver.launch_reduce(d_H, d_S, d_L, d_M, d_info,
-                             /*batch_size=*/1, /*stream=*/nullptr);
-        // Stage 2 (static): produce Λ and U.
-        geneig_finish_n54_launch(
-            reinterpret_cast<const cuDoubleComplex*>(d_L),
-            reinterpret_cast<const cuDoubleComplex*>(d_M),
-            reinterpret_cast<double*>(d_W),
-            reinterpret_cast<cuDoubleComplex*>(d_U),
-            reinterpret_cast<int*>(d_info),
-            /*batch_size=*/1, /*stream=*/nullptr);
+        solver.launch(d_H, d_S, d_W, d_U, d_info,
+                      /*batch_size=*/1, /*stream=*/nullptr);
         CU_CHECK(cuCtxSynchronize());
 
         int gpu_info = -1;
@@ -203,17 +171,11 @@ int main() {
     std::printf("SUMMARY: %d/%d passed, max_eig_rel=%.3e, max_phase=%.3e\n",
                 pass_count, fx.B, max_eig_rel_overall, max_phase_overall);
 
-    CU_CHECK(cuMemFree(d_H));    CU_CHECK(cuMemFree(d_S));
-    CU_CHECK(cuMemFree(d_L));    CU_CHECK(cuMemFree(d_M));
-    CU_CHECK(cuMemFree(d_U));    CU_CHECK(cuMemFree(d_W));
+    CU_CHECK(cuMemFree(d_H));
+    CU_CHECK(cuMemFree(d_S));
+    CU_CHECK(cuMemFree(d_U));
+    CU_CHECK(cuMemFree(d_W));
     CU_CHECK(cuMemFree(d_info));
-
-    // --- Warm compile (second instance) ----------------------------------
-    auto w0 = std::chrono::steady_clock::now();
-    NvrtcGeneigSolver solver2(0);
-    auto w1 = std::chrono::steady_clock::now();
-    const double warm_ms = std::chrono::duration<double, std::milli>(w1 - w0).count();
-    std::printf("warm NVRTC compile: %.1f ms\n", warm_ms);
 
     return (pass_count == fx.B) ? 0 : 1;
 }

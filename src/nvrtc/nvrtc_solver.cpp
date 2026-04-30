@@ -75,7 +75,8 @@ void throw_nvjitlink(nvJitLinkHandle linker, nvJitLinkResult r, const char* call
 
 }  // namespace
 
-NvrtcGeneigSolver::NvrtcGeneigSolver(int device_id) : device_id_(device_id) {
+NvrtcGeneigSolver::NvrtcGeneigSolver(int n, int device_id)
+    : n_(n), device_id_(device_id) {
     using clk = std::chrono::steady_clock;
     auto t_ctor = clk::now();
     auto ms_since = [](clk::time_point a, clk::time_point b) {
@@ -105,18 +106,21 @@ NvrtcGeneigSolver::NvrtcGeneigSolver(int device_id) : device_id_(device_id) {
                                    /*headers=*/nullptr,
                                    /*includeNames=*/nullptr));
 
-    const std::string m_size_def    = "-DM_SIZE=54";
-    const std::string lda_def       = "-DSOLVER_LDA=54";
+    const std::string m_size_def    = "-DM_SIZE="     + std::to_string(n_);
+    const std::string lda_def       = "-DSOLVER_LDA=" + std::to_string(n_);
     // SOLVER_SM is the tuning-database lookup tag for cuSolverDx templates,
-    // not a runtime architecture target. We pin it at SM<800> (Ampere) because
-    // (a) it has full template-database coverage in cuSolverDx 25.12 for
-    // potrf, trsm, and heev across all parameter combinations we use; (b) the
-    // Phase 2 static build used SM<800> and ran correctly on sm_120, confirming
-    // that runtime architecture dispatch is independent of the template-time
-    // tuning tag. The `--gpu-architecture=sm_NN` flag below selects the actual
-    // runtime arch via nvJitLink + the cuSolverDx fatbin.
-    const std::string sm_def        = "-DSOLVER_SM=700";
+    // not a runtime architecture target. SM<800> = Ampere (~164 KB dynamic
+    // shared memory per block opt-in) so the cuSolverDx static_assert that
+    // gates "problem fits in shared memory" passes for larger N than the
+    // V100/SM<700> 96 KB ceiling would allow. The `--gpu-architecture=sm_NN`
+    // flag below selects the actual runtime arch via nvJitLink + the
+    // cuSolverDx fatbin.
+    const std::string sm_def        = "-DSOLVER_SM=800";
     const std::string arch_opt      = "--gpu-architecture=sm_" + std::to_string(arch);
+    // The overlay path MUST come before the upstream cusolverdx include path
+    // so the patched solver_execution.hpp shadows the upstream copy. See
+    // src/nvrtc/cusolverdx_overlay/cusolverdx/detail/solver_execution.hpp.
+    const std::string overlay_inc   = std::string("--include-path=") + CUSOLVERDX_OVERLAY_INCLUDE_DIR;
     const std::string cusolver_inc  = std::string("--include-path=") + CUSOLVERDX_INCLUDE_DIR;
     const std::string cutlass_inc   = std::string("--include-path=") + CUSOLVERDX_CUTLASS_INCLUDE_DIR;
     const std::string cuda_inc      = std::string("--include-path=") + CUDA_INCLUDE_DIR;
@@ -130,6 +134,7 @@ NvrtcGeneigSolver::NvrtcGeneigSolver(int device_id) : device_id_(device_id) {
         lda_def.c_str(),
         sm_def.c_str(),
         arch_opt.c_str(),
+        overlay_inc.c_str(),    // overlay first — shadows upstream
         cusolver_inc.c_str(),
         cutlass_inc.c_str(),
         cuda_inc.c_str(),
@@ -180,7 +185,7 @@ NvrtcGeneigSolver::NvrtcGeneigSolver(int device_id) : device_id_(device_id) {
 
     // ---- Module load + symbol resolution ---------------------------------
     CU_CHECK(cuModuleLoadDataEx(&module_, cubin.data(), 0, nullptr, nullptr));
-    CU_CHECK(cuModuleGetFunction(&kernel_, module_, "geneig_reduce_kernel"));
+    CU_CHECK(cuModuleGetFunction(&kernel_, module_, "geneig_full_kernel"));
     auto t_after_module_load = clk::now();
 
     {
@@ -235,13 +240,13 @@ NvrtcGeneigSolver::~NvrtcGeneigSolver() {
     context_ = nullptr;
 }
 
-void NvrtcGeneigSolver::launch_reduce(CUdeviceptr d_H, CUdeviceptr d_S,
-                                       CUdeviceptr d_L, CUdeviceptr d_M,
-                                       CUdeviceptr d_info,
-                                       int batch_size, CUstream stream) {
+void NvrtcGeneigSolver::launch(CUdeviceptr d_H, CUdeviceptr d_S,
+                                CUdeviceptr d_W, CUdeviceptr d_U,
+                                CUdeviceptr d_info,
+                                int batch_size, CUstream stream) {
     if (batch_size <= 0) return;
     int local_bs = batch_size;
-    void* args[] = { &d_H, &d_S, &d_L, &d_M, &d_info, &local_bs };
+    void* args[] = { &d_H, &d_S, &d_W, &d_U, &d_info, &local_bs };
     CU_CHECK(cuLaunchKernel(kernel_,
                             /*grid:*/ static_cast<unsigned>(batch_size), 1, 1,
                             /*block:*/ block_dim_.x, block_dim_.y, block_dim_.z,

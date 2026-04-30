@@ -44,7 +44,20 @@ Mitigation plan: Phase 3b validates at N ∈ {32, 48, 54, 64, 96, 128}.
 Phase 6 sweep extends to higher N. We document the maximum N at which
 the single-block strategy works and the rationale for the ceiling.
 
-Status: PARTIAL. N=54 validated. Phase 3b extends.
+Status: **PARTIAL** (Phase 3b run). On the development hardware (RTX
+5070 Ti Laptop, sm_120, **101 KB max dynamic shared memory per block**),
+the single-block unified kernel works at fp64 epsilon for N ∈
+{16, 32, 48, 54} (4 sizes × 2 fixtures = 8/8 pairs PASS). N ∈
+{64, 96, 128} fail because
+`Cholesky::shared_memory_size + Heev::shared_memory_size` exceeds the
+device's 101 KB per-block cap. cuSolverDx's
+`static_assert "doesn't fit in shared memory"` catches the failure at
+NVRTC compile time on this hardware. H100 (228 KB per-block opt-in)
+should extend the single-block ceiling to roughly N ≈ 80; beyond
+that, multi-block strategies are needed and are out of Phase 3b
+scope. See `docs/PHASE3_NVRTC.md` for the full table of validated
+sizes and per-N timings. Sunny's SW08 (N=54) is the operative size
+and is fully validated.
 
 ### R-4: Numerical correctness on physical Sunny matrices
 

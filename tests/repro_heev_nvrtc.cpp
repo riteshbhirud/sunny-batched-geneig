@@ -1,4 +1,13 @@
-// Phase 3a bug repro: cuSolverDx 25.12 NVRTC + heev fails to compile.
+// Phase 3a bug repro / Phase 3b overlay verification.
+//
+// Originally written to demonstrate that cuSolverDx 25.12 + NVRTC fails to
+// compile a `Function<function::heev>` specialization. Phase 3b ships a
+// header overlay (src/nvrtc/cusolverdx_overlay/) that fixes the upstream
+// declaration order. With the overlay's include-path injected FIRST, this
+// repro now succeeds. Without the overlay (delete CUSOLVERDX_OVERLAY_INCLUDE_DIR
+// from this target's compile defs and remove the first --include-path entry
+// below), it reverts to the original failure with the 6 errors documented in
+// docs/CUSOLVERDX_NVRTC_HEEV_BUG.md.
 //
 // Standalone host-side NVRTC driver. No dependency on the project's
 // NvrtcGeneigSolver class. Mirrors the NVIDIA-shipped nvrtc_potrs.cpp
@@ -72,6 +81,7 @@ int main() {
                                    0, nullptr, nullptr));
 
     const std::string arch_opt     = "--gpu-architecture=sm_" + std::to_string(arch);
+    const std::string overlay_inc  = std::string("--include-path=") + CUSOLVERDX_OVERLAY_INCLUDE_DIR;
     const std::string cusolver_inc = std::string("--include-path=") + CUSOLVERDX_INCLUDE_DIR;
     const std::string cutlass_inc  = std::string("--include-path=") + CUSOLVERDX_CUTLASS_INCLUDE_DIR;
     const std::string cuda_inc     = std::string("--include-path=") + CUDA_INCLUDE_DIR;
@@ -82,6 +92,7 @@ int main() {
         "-dlto",
         "--relocatable-device-code=true",
         arch_opt.c_str(),
+        overlay_inc.c_str(),    // overlay first — shadows upstream
         cusolver_inc.c_str(),
         cutlass_inc.c_str(),
         cuda_inc.c_str(),

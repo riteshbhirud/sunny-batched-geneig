@@ -104,30 +104,51 @@ unchanged; under NVRTC the heev/gesvd `get_workspace_size()` initializer
 can resolve `max_threads_per_block` because it is now declared lexically
 earlier.
 
-## Project workaround
+## Project workaround status
 
-Phase 3a uses a hybrid two-kernel pipeline instead of patching the cuSolverDx
-headers:
+**Phase 3b: applied via local header overlay.** The hybrid two-kernel split
+that 3a used has been removed. The unified NVRTC kernel now runs all five
+stages (`potrf → trsm × 2 → heev → trsm`) inside one launch.
 
-- **NVRTC kernel** (`geneig_reduce_kernel`, runtime-compiled, will be
-  templated on N in Phase 3b): runs `potrf(S) → trsm(L⁻¹·H) → trsm(·L⁻ᴴ)`,
-  produces L and M = L⁻¹ H L⁻ᴴ. Uses only `Function<function::potrf>` and
-  `Function<function::trsm>` operators, none of which trigger the bug.
-- **Static N=54 kernel** (`geneig_finish_n54_kernel`, statically compiled
-  by nvcc): consumes L and M from the NVRTC kernel, runs
-  `heev(M) → trsm(L⁻ᴴ·V)`, produces eigenvalues Λ and generalised
-  eigenvectors U. Uses `Function<function::heev>` and
-  `Function<function::trsm>` — heev compiles fine here because nvcc tolerates
-  the declaration order.
+The overlay lives at
+[`src/nvrtc/cusolverdx_overlay/cusolverdx/detail/solver_execution.hpp`](../src/nvrtc/cusolverdx_overlay/cusolverdx/detail/solver_execution.hpp).
+It is a verbatim copy of the upstream cuSolverDx 25.12 header with two
+mechanical reorders inside `block_execution<Operators...>`:
 
-Data is GPU-resident between the two kernels. The split adds two extra
-device-memory tiles (L and M, 54×54 cdouble each = ~46 KB each) but no
-extra host↔device traffic.
+1. `max_threads_per_block` declared before `workspace_size` (the original
+   bug above).
+2. The alias block (`type`, `a_arrangement`, `b_arrangement`, `transpose`,
+   `fill_mode`, `side`, `diag`, `job`, `sm`) moved up next to
+   `batches_per_block`. These were originally at the bottom of the class
+   and are referenced by `get_suggested_batches_per_block()`,
+   `get_suggested_block_dim()`, and `get_workspace_size()` member functions
+   declared earlier in the class. NVRTC's name lookup does not see them
+   when class-scope member-function bodies reference them out of declaration
+   order; same root cause as the `max_threads_per_block` issue, surfaced
+   only after the first reorder lifted the `max_threads_per_block` block.
 
-When cuSolverDx ships a fix, the hybrid can collapse back to a single
-NVRTC kernel — the kernel-source surgery is local to
-[`src/nvrtc/kernel_source.hpp`](../src/nvrtc/kernel_source.hpp) and
-[`src/nvrtc/nvrtc_solver.cpp`](../src/nvrtc/nvrtc_solver.cpp).
+Both reorders are mechanical, no semantic change. Verified end-to-end via
+[`tests/repro_heev_nvrtc.cpp`](../tests/repro_heev_nvrtc.cpp) (fails
+without overlay, succeeds with it; same source modulo include path).
+
+The overlay is injected into NVRTC's include search path *before* the
+upstream cuSolverDx include path, so `#include "cusolverdx/detail/solver_execution.hpp"`
+resolves to our patched copy. Other cusolverdx headers come from upstream
+unmodified.
+
+**Removal procedure** when an upstream cuSolverDx release fixes both
+declaration orders:
+1. Delete `src/nvrtc/cusolverdx_overlay/`.
+2. Remove `CUSOLVERDX_OVERLAY_INCLUDE_DIR` from
+   `target_compile_definitions(nvrtc_geneig ...)` and the two repro
+   targets in `tests/CMakeLists.txt`.
+3. Remove the `overlay_inc` `--include-path` injection in
+   [`src/nvrtc/nvrtc_solver.cpp`](../src/nvrtc/nvrtc_solver.cpp) and
+   [`tests/repro_heev_nvrtc.cpp`](../tests/repro_heev_nvrtc.cpp).
+
+The overlay applies to commit a64a862's hybrid split as well — should we
+ever need to revert to the hybrid, the overlay is independent of which
+kernel layout we ship.
 
 ## Related observation: nvJitLink performance
 

@@ -63,21 +63,22 @@ set_target_properties(test_full_batched_n54 PROPERTIES
     INTERPROCEDURAL_OPTIMIZATION ON
 )
 
-# Phase 3a — hybrid NVRTC + static-link correctness test. Links both libraries:
-#   nvrtc_geneig : reduce stage (NVRTC-compiled potrf + 2 trsms)
-#   geneig_fixed : finishing stage (static heev + back-transform trsm)
+# Phase 3b regression — single-N=54 unified-kernel correctness test.
 add_executable(test_nvrtc_n54 test_nvrtc_n54.cpp)
 target_link_libraries(test_nvrtc_n54
     PRIVATE
         nvrtc_geneig
-        geneig_fixed
-        LAPACK::lapacke
         CUDA::cudart
         CUDA::cuda_driver
 )
-set_target_properties(test_nvrtc_n54 PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-    INTERPROCEDURAL_OPTIMIZATION ON
+
+# Phase 3b — multi-N validation of the unified NVRTC kernel.
+add_executable(test_nvrtc_multiN test_nvrtc_multiN.cpp)
+target_link_libraries(test_nvrtc_multiN
+    PRIVATE
+        nvrtc_geneig
+        CUDA::cudart
+        CUDA::cuda_driver
 )
 
 # Phase 3a — minimal NVRTC bug repros (heev fails, potrf succeeds).
@@ -89,6 +90,7 @@ foreach(_t repro_heev_nvrtc repro_potrf_nvrtc)
         PRIVATE
             CUSOLVERDX_INCLUDE_DIR="${MathDx_INCLUDE_DIR}"
             CUSOLVERDX_CUTLASS_INCLUDE_DIR="${MathDx_CUTLASS_INCLUDE_DIR}"
+            CUSOLVERDX_OVERLAY_INCLUDE_DIR="${CMAKE_SOURCE_DIR}/src/nvrtc/cusolverdx_overlay"
             CUDA_INCLUDE_DIR="${CUDAToolkit_INCLUDE_DIRS}"
     )
 endforeach()
