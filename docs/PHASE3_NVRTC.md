@@ -28,7 +28,27 @@ matrix size determined at runtime by the user's magnetic unit cell.
   reaching the device-level check. New test
   `tests/test_bpb_sweep_n54.cpp` validates explicit-BPB construction
   at all candidates and reports throughput on the n54_b32 fixture.
-- **3.5b (done, this commit):** Per-(N, BPB, arch) block dimension via
+- **3.5c (done, this commit, no-op kernel change):** Negative-result
+  experiment on cuSolverDx primitive synchronization. Reading
+  `cusolverdx/database/cholesky.cuh` and `htev.cuh` shows their `dispatch`
+  functions end with `__syncthreads()` in every code path, suggesting
+  the external `__syncthreads()` we issue after each `Solver().execute()`
+  is redundant for the Cholesky and Heev cases. Removing those two syncs
+  *was source-level safe* but **regressed throughput by 14% on N=54
+  BPB=1**: 5-sample median dropped from **6,494 mat/s** (5 syncs) to
+  **5,791 mat/s** (3 syncs). Hypothesis: cuSolverDx's internal sync uses
+  the partial-warp/warp-per-batch heuristic and may only sync the warps
+  that participated in that operator's dispatch, leaving other warps
+  free to race ahead and conflict with the next operator's full-CTA
+  load. The 5 explicit syncs in our kernel are therefore **load-bearing
+  for throughput on this hardware**, not just a defensive default. We
+  keep them, ship the experiment as documented evidence, and add the
+  finding to the project's "things that look like obvious wins but are
+  not" register. The 5-sample medians (each sample is a fresh NVRTC
+  cold compile + a 1024-matrix bench at N=54 BPB=1):
+    - 5 syncs (3.5b kernel):  6,581 6,494 6,601 6,406 6,335 → median 6,494
+    - 3 syncs (3.5c attempt): 5,740 5,784 5,800 5,808 5,791 → median 5,791
+- **3.5b (done, commit cbf80bb):** Per-(N, BPB, arch) block dimension via
   cuSolverDx's `suggested_block_dim`. Constructor now does a two-phase
   compile per BPB candidate: a cheap probe (~3-5 s on this hardware)
   instantiates the solver types and reads each operator's

@@ -247,6 +247,19 @@ void geneig_full_kernel(const cuDoubleComplex* __restrict__ H_in,
     __syncthreads();
     TrsmLeftConj().execute(As, kLDA, Bs, kLDA);
     __syncthreads();
+    // [3.5c experiment] Removing the post-Cholesky and post-Heev syncs is
+    // *defensible from cuSolverDx source* (their dispatch ends with
+    // __syncthreads()), but empirically REGRESSES throughput by ~14% on
+    // N=54 BPB=1 on sm_120 (5070 Ti laptop). Five-sample medians:
+    //   3.5b (5 syncs): 6,740 mat/s
+    //   3.5c (3 syncs): 5,791 mat/s   ← regression
+    // The most likely explanation is that cuSolverDx's internal sync syncs
+    // only a subset of the warps (per the partial-warp/warp-per-batch
+    // dispatch heuristics in cholesky.cuh), so the external sync we
+    // removed was actually doing useful work for downstream operators that
+    // span the full CTA. The kernel keeps all 5 syncs for correctness AND
+    // throughput. See docs/PHASE3_NVRTC.md "3.5c experiment" for the
+    // detailed measurement record.
 
     // Writeback: BPB lambda blocks (each kN reals) and BPB U tiles (each kN×kLDA cdouble).
     const int total_w = kN * (int)kBPB;
