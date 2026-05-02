@@ -252,10 +252,163 @@ matrix size determined at runtime by the user's magnetic unit cell.
   same process. Persisting the autotune cache to disk is deferred to
   Phase 3d (cubin cache).
 
-- **3c:** Per-size CUmodule cache inside `NvrtcGeneigSolver`.
-  Construct once per N, reuse across all matrices.
-- **3d:** Disk-backed cubin cache, keyed on (M_SIZE, arch, library
-  version hash). Solves the cold-start problem across Julia sessions.
+- **3.5f (done, this commit):** Two-layer module cache. The 3a–3.5e plan
+  had separate items for the in-process CUmodule cache (3c) and the
+  on-disk cubin cache (3d); 3.5f delivers both layers in one pass and
+  retires both 3c and 3d. The 213-second cold compile becomes the
+  one-and-only first-time cost; subsequent constructions of the same
+  `(N, BPB, arch, BlockDim.x)` skip NVRTC + nvJitLink entirely.
+
+  ### Architecture
+
+  ```
+  NvrtcGeneigSolver(N, dev, bpb, force, tuning, cache)
+        │
+        ├── determine (N, bpb, BlockDim.x) [probe / autotune / force]
+        │
+        └── acquire_module_(bpb, BlockDim.x, cache_mode)
+              │
+              ├── Layer 1: in-process std::map<(N,bpb,arch,bdx), weak_ptr<CachedModule>>
+              │   guarded by std::mutex; cache holds weak_ptr so an entry
+              │   reclaims when the last solver instance referencing it
+              │   destructs.
+              │
+              ├── Layer 2: on-disk cubin file at
+              │   $XDG_CACHE_HOME/sunny_geneig/cubins/
+              │     {N}_{bpb}_{arch}_{bdx}_lib{libhash16}_src{srchash16}.cubin
+              │   loaded via cuModuleLoadDataEx — skips NVRTC + nvJitLink.
+              │
+              └── Layer 3: full compile (NVRTC → LTO IR → nvJitLink → cubin)
+                  fall-through. The fresh cubin is then written to disk
+                  (atomic rename) and inserted into the in-process map.
+  ```
+
+  Lifetime: `CachedModule` owns its `CUmodule` via destructor (`cuModuleUnload`).
+  Each solver holds one `std::shared_ptr<CachedModule>`; the cache map
+  holds a `std::weak_ptr`. When the last solver for a key destructs,
+  the module unloads (instead of leaking until process exit).
+
+  ### Cache-key hashing
+
+  The disk filename embeds two 64-bit content hashes — a **library hash**
+  and a **source hash** — so a cubin compiled against an old MathDx (or
+  an old `kernel_source.hpp`) becomes a key miss after either changes,
+  rather than silently loading and crashing the device.
+
+  | Hash         | Input                                              | Algorithm   |
+  |--------------|----------------------------------------------------|-------------|
+  | `lib_hash`   | first 8 bytes of `libcusolverdx.fatbin` ‖ filesize | FNV-1a-64   |
+  | `source_hash`| entire `nvrtc_geneig::kKernelSource` byte string   | FNV-1a-64   |
+
+  FNV-1a is a content fingerprint, not crypto. The cache key already
+  pins `(N, bpb, arch, BlockDim.x)` exactly; the hashes only need to
+  detect *which* library and *which* source produced the cubin.
+  Collisions on small inputs at 64-bit are astronomically unlikely
+  (~2⁻⁶⁴) and not a security concern in this context.
+
+  Filename example from the test run:
+
+  ```
+  /home/rb/.cache/sunny_geneig/cubins/54_1_120_128_libf708a7883b6bcdf3_src6338eccfe1c378a8.cubin
+  ```
+
+  ### Cache directory location
+
+  Resolved in this order (first hit wins):
+  1. `$SUNNY_GENEIG_CACHE_DIR` if set (test override hatch);
+  2. Linux: `$XDG_CACHE_HOME/sunny_geneig/cubins`, else `$HOME/.cache/sunny_geneig/cubins`;
+  3. macOS: `$HOME/Library/Caches/sunny_geneig/cubins`;
+  4. Windows: `%LOCALAPPDATA%\sunny_geneig\cubins`;
+  5. `/tmp/sunny_geneig/cubins` as a last-resort fallback.
+
+  Created with `mkdir -p` semantics on first write.
+
+  ### Multi-process and durability
+
+  Disk writes go to `<final>.tmp.<pid>.<nanos>` then `rename(2)` to the
+  final path. POSIX `rename` is atomic on the same filesystem, so two
+  Julia sessions launching simultaneously cannot produce a partial cubin
+  visible to a third reader. If concurrent compilers race, the second
+  rename atomically replaces the first; both wrote correct cubins so
+  any winner is fine.
+
+  ### Validation on load
+
+  Three checks before trusting a cached cubin:
+  1. **Size > 1024 bytes.** Earlier short writes (interrupted by a kill
+     before `fclose`) get rejected here.
+  2. **ELF magic** (`0x7F 'E' 'L' 'F'`). Detects bit-flips, manual edits,
+     or filesystem corruption that survived size sanity. The corruption
+     test deliberately overwrites this and the cache must recover.
+  3. **`cuModuleLoadDataEx` succeeds.** Catches semantic invalidity that
+     made it past the magic check.
+
+  Any of the three failing → log, `unlink` the bad file, fall through
+  to compile.
+
+  ### Cache modes (constructor parameter)
+
+  | `CacheMode`  | In-proc | Disk read | Disk write | Use                     |
+  |--------------|:-------:|:---------:|:----------:|-------------------------|
+  | `Auto` (default) |  ✓  |     ✓     |     ✓      | production              |
+  | `NoDisk`     |    ✓    |     ✗     |     ✗      | testing in-proc only    |
+  | `NoCache`    |    ✗    |     ✗     |     ✗      | first-compile timings   |
+
+  ### Test results
+
+  **`test_cache_n54`** (clean cache → cold → warm-disk → in-process → no-cache):
+
+  | phase       | BDx | construct (ms) | acquire (ms) | cache layer | validation |
+  |-------------|----:|---------------:|-------------:|-------------|------------|
+  | cold disk   | 128 |      212,748.0 |    205,394.2 | compile     | PASS (eig=2.16e-15, phase=3.77e-15) |
+  | warm disk   | 128 |        3,624.8 |        285.3 | disk        | PASS (eig=2.16e-15, phase=3.77e-15) |
+  | in-process  | 128 |        3,211.3 |        0.007 | in-process  | PASS (eig=2.16e-15, phase=3.77e-15) |
+  | no-cache    | 128 |      198,663.2 |    195,549.2 | compile     | PASS (eig=2.16e-15, phase=3.77e-15) |
+
+  Targets met:
+  - warm disk `acquire (ms)` < 500ms target → **285.3 ms** ✓
+  - in-process `acquire (ms)` < 5ms target → **0.007 ms** ✓ (~720× headroom)
+  - all four phases bit-identical W and U output (W=`aa3c8fbb3e8db027`,
+    U=`fbafa39dcdb6fbdf`); the disk cache is correctness-preserving.
+
+  Note: `construct (ms)` for warm-disk and in-process is ~3 s because of
+  the unconditional cuSolverDx probe at the start of the constructor
+  (~3.2 s NVRTC compile of the small probe kernel that reads
+  `__constant__ suggested_block_dim`). The probe is independent of the
+  module cache; eliminating it would require a separate cache for the
+  probe constants. `acquire_module_ms()` on the table excludes the probe
+  and reports purely the cache-layer time.
+
+  **`test_cache_invalidation`** (corrupt cubin → recover):
+
+  ```
+  solver A correct:                          PASS (eig=2.16e-15, phase=3.77e-15)
+  solver A cubin written:                    PASS (48,941,656 bytes)
+  solver B took compile path (not disk):     PASS (layer=compile)
+  solver B correct after recompile:          PASS (eig=2.16e-15, phase=3.77e-15)
+  cubin ELF magic restored:                  PASS (post_size=48,941,656 bytes)
+  A and B produce bit-identical output:      PASS (W=aa3c8fbb3e8db027, U=fbafa39dcdb6fbdf)
+  ```
+
+  Step-by-step: solver A populates the cache (cold compile + disk write).
+  Solver A is destructed; we manually overwrite the first 4 bytes of the
+  cubin file with `'XXXX'`. Solver B is constructed with the same key —
+  the disk loader's ELF magic check trips, the bad file is `unlink`ed,
+  the compile path runs, the new cubin is atomically written, and B
+  produces output bit-identical to A.
+
+  ### Operational impact
+
+  For Sunny.jl users, this drops repeat cold-start cost from 213 s to
+  ≈285 ms across Julia sessions. With the autotune cache (3.5e) layered
+  on top, even autotune-mode constructions hit the module cache for the
+  winning BlockDim.x — observed in `test_autotune_n54`'s `autotune2`
+  construction completing in 3.4 s (probe + cache hit) instead of the
+  ~900 s autotune sweep on first run. The cache directory is durable
+  across reboots; clearing it (`rm -rf ~/.cache/sunny_geneig/`) reverts
+  to first-compile timings, which is also how the test sets up its
+  cold-start phase.
+
 - **3e:** Performance characterization vs the static N=54 path,
   plus end-to-end timing on the existing batched test.
 

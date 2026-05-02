@@ -20,14 +20,23 @@
 #include <nvJitLink.h>
 #include <nvrtc.h>
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <complex>
+#include <cstdint>
 #include <cstdio>
-#include <initializer_list>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <initializer_list>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <set>
 #include <sstream>
@@ -230,39 +239,361 @@ unsigned int NvrtcGeneigSolver::probe_suggested_block_dim_x_(int bpb) {
     return chosen;
 }
 
-void NvrtcGeneigSolver::compile_production_(int bpb, unsigned int block_dim_x) {
+// Phase 3.5f — split the old compile_production_ into a cubin-producing
+// half and a module-loading half so the cache layer can interpose on the
+// boundary. compile_production_ is retained for the autotune sweep (which
+// deliberately does not route through the cache).
+
+std::vector<char> NvrtcGeneigSolver::compile_to_cubin_(int bpb,
+                                                       unsigned int block_dim_x) {
     using clk = std::chrono::steady_clock;
     auto t0 = clk::now();
     const int arch = device_arch(device_id_);
     const CompileOpts opts = make_opts(n_, bpb, block_dim_x, arch);
-    const std::vector<char> cubin = nvrtc_to_cubin(
+    std::vector<char> cubin = nvrtc_to_cubin(
         nvrtc_geneig::kKernelSource, "geneig_full_kernel.cu",
         opts.ptrs, arch,
         ("production n=" + std::to_string(n_) + " bpb=" + std::to_string(bpb)
          + " bdx=" + std::to_string(block_dim_x)).c_str());
-
-    if (module_) { cuModuleUnload(module_); module_ = nullptr; }
-    CU_CHECK(cuModuleLoadDataEx(&module_, cubin.data(), 0, nullptr, nullptr));
-    CU_CHECK(cuModuleGetFunction(&kernel_, module_, "geneig_full_kernel"));
-
-    {
-        CUdeviceptr ptr; std::size_t size;
-        CU_CHECK(cuModuleGetGlobal(&ptr, &size, module_, "solver_block_dim"));
-        if (size != sizeof(dim3)) throw std::runtime_error("solver_block_dim has unexpected size");
-        CU_CHECK(cuMemcpyDtoH(&block_dim_, ptr, size));
-    }
-    {
-        CUdeviceptr ptr; std::size_t size;
-        CU_CHECK(cuModuleGetGlobal(&ptr, &size, module_, "solver_shared_memory_size"));
-        if (size != sizeof(unsigned int)) throw std::runtime_error("solver_shared_memory_size has unexpected size");
-        CU_CHECK(cuMemcpyDtoH(&shared_mem_bytes_, ptr, size));
-    }
     auto t1 = clk::now();
     const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     std::fprintf(stderr,
-        "[NvrtcGeneigSolver] production (n=%d bpb=%d bdx=%u): %.0f ms; "
-        "shared_mem=%u, cubin=%zu\n",
-        n_, bpb, block_dim_x, ms, shared_mem_bytes_, cubin.size());
+        "[NvrtcGeneigSolver] compile (n=%d bpb=%d bdx=%u): %.0f ms; "
+        "cubin=%zu\n",
+        n_, bpb, block_dim_x, ms, cubin.size());
+    return cubin;
+}
+
+std::shared_ptr<CachedModule>
+NvrtcGeneigSolver::build_module_from_cubin_(const std::vector<char>& cubin,
+                                            int bpb,
+                                            unsigned int block_dim_x) {
+    auto m = std::make_shared<CachedModule>();
+    m->n                 = n_;
+    m->batches_per_block = bpb;
+    m->block_dim_x       = static_cast<int>(block_dim_x);
+    CU_CHECK(cuModuleLoadDataEx(&m->module, cubin.data(), 0, nullptr, nullptr));
+    CU_CHECK(cuModuleGetFunction(&m->kernel, m->module, "geneig_full_kernel"));
+    {
+        CUdeviceptr ptr; std::size_t size;
+        CU_CHECK(cuModuleGetGlobal(&ptr, &size, m->module, "solver_block_dim"));
+        if (size != sizeof(dim3))
+            throw std::runtime_error("solver_block_dim has unexpected size");
+        CU_CHECK(cuMemcpyDtoH(&m->block_dim, ptr, size));
+    }
+    {
+        CUdeviceptr ptr; std::size_t size;
+        CU_CHECK(cuModuleGetGlobal(&ptr, &size, m->module, "solver_shared_memory_size"));
+        if (size != sizeof(unsigned int))
+            throw std::runtime_error("solver_shared_memory_size has unexpected size");
+        CU_CHECK(cuMemcpyDtoH(&m->shared_mem_bytes, ptr, size));
+    }
+    return m;
+}
+
+void NvrtcGeneigSolver::compile_production_(int bpb, unsigned int block_dim_x) {
+    auto cubin = compile_to_cubin_(bpb, block_dim_x);
+    auto m     = build_module_from_cubin_(cubin, bpb, block_dim_x);
+    // Replace the autotune-instance handle. The previous CachedModule's
+    // shared_ptr ref drops here; if no other instance referenced it, its
+    // destructor runs cuModuleUnload immediately.
+    module_handle_    = m;
+    module_           = m->module;
+    kernel_           = m->kernel;
+    block_dim_        = m->block_dim;
+    shared_mem_bytes_ = m->shared_mem_bytes;
+    std::fprintf(stderr,
+        "[NvrtcGeneigSolver] autotune-step module loaded "
+        "(n=%d bpb=%d bdx=%u): shared_mem=%u\n",
+        n_, bpb, block_dim_x, shared_mem_bytes_);
+}
+
+// ---------------------------------------------------------------------
+// Phase 3.5f — cache implementation.
+// ---------------------------------------------------------------------
+
+namespace {
+
+// FNV-1a 64-bit. Deterministic content fingerprint, not cryptographic.
+// Sufficient for cache invalidation: collisions on small inputs are
+// astronomically unlikely, and the cache key already pins the
+// (n, bpb, arch, block_dim_x) explicitly.
+constexpr std::uint64_t kFnv64Offset = 0xcbf29ce484222325ULL;
+constexpr std::uint64_t kFnv64Prime  = 0x100000001b3ULL;
+
+std::uint64_t fnv1a64(const void* data, std::size_t n,
+                      std::uint64_t seed = kFnv64Offset) {
+    std::uint64_t h = seed;
+    const auto* p = static_cast<const unsigned char*>(data);
+    for (std::size_t i = 0; i < n; ++i) {
+        h ^= static_cast<std::uint64_t>(p[i]);
+        h *= kFnv64Prime;
+    }
+    return h;
+}
+
+// Hash of the cuSolverDx fatbin file: first 8 bytes + the byte size. Cheap
+// and good enough to detect a library swap without reading the whole file.
+std::uint64_t lib_hash_cached() {
+    static std::uint64_t cached = 0;
+    static bool          init   = false;
+    if (init) return cached;
+    init = true;
+    struct stat st;
+    if (::stat(CUSOLVERDX_FATBIN_PATH, &st) != 0) {
+        cached = 0xDEADBEEFDEADBEEFULL;
+        return cached;
+    }
+    int fd = ::open(CUSOLVERDX_FATBIN_PATH, O_RDONLY);
+    if (fd < 0) {
+        cached = 0xDEADBEEFDEADBEEFULL;
+        return cached;
+    }
+    unsigned char head[8] = {0};
+    auto rd = ::read(fd, head, sizeof(head));
+    ::close(fd);
+    std::uint64_t h = fnv1a64(head, sizeof(head));
+    const std::uint64_t sz64 = static_cast<std::uint64_t>(st.st_size);
+    h = fnv1a64(&sz64, sizeof(sz64), h);
+    cached = h;
+    (void)rd;
+    return cached;
+}
+
+std::uint64_t source_hash_cached() {
+    static std::uint64_t cached = 0;
+    static bool          init   = false;
+    if (init) return cached;
+    init = true;
+    cached = fnv1a64(nvrtc_geneig::kKernelSource,
+                     std::strlen(nvrtc_geneig::kKernelSource));
+    return cached;
+}
+
+void mkdir_p_silent(const std::string& path) {
+    // Walk path components, mkdir each. Ignore EEXIST.
+    std::string cur;
+    for (std::size_t i = 0; i < path.size(); ++i) {
+        if (path[i] == '/' && i > 0) {
+            cur = path.substr(0, i);
+            ::mkdir(cur.c_str(), 0755);
+        }
+    }
+    ::mkdir(path.c_str(), 0755);
+}
+
+bool file_exists(const std::string& path) {
+    struct stat st;
+    return ::stat(path.c_str(), &st) == 0;
+}
+
+}  // namespace
+
+std::map<ModuleCacheKey, std::weak_ptr<CachedModule>>
+    NvrtcGeneigSolver::in_process_cache_;
+std::mutex NvrtcGeneigSolver::in_process_cache_mutex_;
+
+CachedModule::~CachedModule() {
+    if (module) {
+        cuModuleUnload(module);
+        module = nullptr;
+    }
+}
+
+std::string NvrtcGeneigSolver::cache_dir() {
+    if (const char* env = std::getenv("SUNNY_GENEIG_CACHE_DIR")) {
+        return std::string(env);
+    }
+#if defined(__APPLE__)
+    if (const char* home = std::getenv("HOME"))
+        return std::string(home) + "/Library/Caches/sunny_geneig/cubins";
+#elif defined(_WIN32)
+    if (const char* lad = std::getenv("LOCALAPPDATA"))
+        return std::string(lad) + "\\sunny_geneig\\cubins";
+#else
+    if (const char* xdg = std::getenv("XDG_CACHE_HOME"))
+        return std::string(xdg) + "/sunny_geneig/cubins";
+    if (const char* home = std::getenv("HOME"))
+        return std::string(home) + "/.cache/sunny_geneig/cubins";
+#endif
+    return std::string("/tmp/sunny_geneig/cubins");
+}
+
+std::string NvrtcGeneigSolver::cubin_path(const ModuleCacheKey& key) {
+    char buf[512];
+    std::snprintf(buf, sizeof(buf),
+                  "%s/%d_%d_%d_%d_lib%016llx_src%016llx.cubin",
+                  cache_dir().c_str(),
+                  key.n, key.bpb, key.arch, key.block_dim_x,
+                  static_cast<unsigned long long>(lib_hash_cached()),
+                  static_cast<unsigned long long>(source_hash_cached()));
+    return std::string(buf);
+}
+
+std::shared_ptr<CachedModule>
+NvrtcGeneigSolver::try_load_disk_(const ModuleCacheKey& key) {
+    const std::string path = cubin_path(key);
+    if (!file_exists(path)) return nullptr;
+
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) {
+        std::fprintf(stderr, "[cache] disk open failed: %s\n", path.c_str());
+        return nullptr;
+    }
+    const std::streamsize sz = f.tellg();
+    f.seekg(0);
+    if (sz < 1024) {
+        std::fprintf(stderr,
+            "[cache] disk file too small (%lld bytes), removing: %s\n",
+            static_cast<long long>(sz), path.c_str());
+        f.close();
+        std::remove(path.c_str());
+        return nullptr;
+    }
+    std::vector<char> cubin(static_cast<std::size_t>(sz));
+    f.read(cubin.data(), sz);
+    if (!f) {
+        std::fprintf(stderr, "[cache] disk read failed: %s\n", path.c_str());
+        return nullptr;
+    }
+    // ELF magic check (CUDA cubins are ELF objects: 0x7F 'E' 'L' 'F').
+    if (!(cubin.size() >= 4
+          && static_cast<unsigned char>(cubin[0]) == 0x7F
+          && cubin[1] == 'E' && cubin[2] == 'L' && cubin[3] == 'F')) {
+        std::fprintf(stderr,
+            "[cache] disk file bad ELF magic, removing: %s\n", path.c_str());
+        std::remove(path.c_str());
+        return nullptr;
+    }
+    try {
+        return build_module_from_cubin_(cubin, key.bpb,
+                                         static_cast<unsigned int>(key.block_dim_x));
+    } catch (const std::exception& e) {
+        std::fprintf(stderr,
+            "[cache] cuModuleLoadDataEx failed for cached cubin %s: %s — "
+            "removing and falling back to compile.\n",
+            path.c_str(), e.what());
+        std::remove(path.c_str());
+        return nullptr;
+    }
+}
+
+void NvrtcGeneigSolver::write_disk_(const ModuleCacheKey& key,
+                                    const std::vector<char>& cubin) {
+    mkdir_p_silent(cache_dir());
+    const std::string final_path = cubin_path(key);
+    char tmp_path[768];
+    std::snprintf(tmp_path, sizeof(tmp_path),
+                  "%s.tmp.%d.%lld",
+                  final_path.c_str(),
+                  static_cast<int>(::getpid()),
+                  static_cast<long long>(
+                      std::chrono::steady_clock::now().time_since_epoch().count()));
+
+    {
+        std::ofstream f(tmp_path, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            std::fprintf(stderr,
+                "[cache] tmp open failed (cannot write disk cache): %s\n",
+                tmp_path);
+            return;
+        }
+        f.write(cubin.data(), static_cast<std::streamsize>(cubin.size()));
+        if (!f) {
+            std::fprintf(stderr,
+                "[cache] tmp write failed: %s\n", tmp_path);
+            f.close();
+            std::remove(tmp_path);
+            return;
+        }
+    }
+    if (std::rename(tmp_path, final_path.c_str()) != 0) {
+        std::fprintf(stderr,
+            "[cache] atomic rename failed: %s -> %s\n",
+            tmp_path, final_path.c_str());
+        std::remove(tmp_path);
+        return;
+    }
+    std::fprintf(stderr,
+        "[cache] disk write OK: %s (%zu bytes)\n",
+        final_path.c_str(), cubin.size());
+}
+
+void NvrtcGeneigSolver::acquire_module_(int bpb, unsigned int block_dim_x,
+                                         CacheMode cache_mode) {
+    using clk = std::chrono::steady_clock;
+    const auto t0 = clk::now();
+    const int  arch = device_arch(device_id_);
+    const ModuleCacheKey key{n_, bpb, arch, static_cast<int>(block_dim_x)};
+
+    // Layer 1: in-process cache (skipped only by NoCache).
+    if (cache_mode != CacheMode::NoCache) {
+        std::lock_guard<std::mutex> lock(in_process_cache_mutex_);
+        auto it = in_process_cache_.find(key);
+        if (it != in_process_cache_.end()) {
+            if (auto h = it->second.lock()) {
+                module_handle_    = h;
+                module_           = h->module;
+                kernel_           = h->kernel;
+                block_dim_        = h->block_dim;
+                shared_mem_bytes_ = h->shared_mem_bytes;
+                cache_layer_used_ = "in-process";
+                std::fprintf(stderr,
+                    "[cache] in-process HIT (n=%d bpb=%d arch=%d bdx=%u)\n",
+                    n_, bpb, arch, block_dim_x);
+                acquire_module_ms_ = std::chrono::duration<double, std::milli>(
+                    clk::now() - t0).count();
+                return;
+            }
+            // Expired weak_ptr — purge and fall through.
+            in_process_cache_.erase(it);
+        }
+    }
+
+    // Layer 2: on-disk cubin cache (skipped by NoDisk and NoCache).
+    if (cache_mode == CacheMode::Auto) {
+        if (auto h = try_load_disk_(key)) {
+            module_handle_    = h;
+            module_           = h->module;
+            kernel_           = h->kernel;
+            block_dim_        = h->block_dim;
+            shared_mem_bytes_ = h->shared_mem_bytes;
+            cache_layer_used_ = "disk";
+            {
+                std::lock_guard<std::mutex> lock(in_process_cache_mutex_);
+                in_process_cache_[key] = h;
+            }
+            std::fprintf(stderr,
+                "[cache] disk HIT %s\n", cubin_path(key).c_str());
+            acquire_module_ms_ = std::chrono::duration<double, std::milli>(
+                clk::now() - t0).count();
+            return;
+        }
+    }
+
+    // Layer 3: full compile.
+    std::fprintf(stderr,
+        "[cache] MISS — compiling (n=%d bpb=%d arch=%d bdx=%u)\n",
+        n_, bpb, arch, block_dim_x);
+    auto cubin = compile_to_cubin_(bpb, block_dim_x);
+    auto h     = build_module_from_cubin_(cubin, bpb, block_dim_x);
+
+    if (cache_mode == CacheMode::Auto) {
+        write_disk_(key, cubin);
+    }
+    if (cache_mode != CacheMode::NoCache) {
+        std::lock_guard<std::mutex> lock(in_process_cache_mutex_);
+        in_process_cache_[key] = h;
+    }
+
+    module_handle_    = h;
+    module_           = h->module;
+    kernel_           = h->kernel;
+    block_dim_        = h->block_dim;
+    shared_mem_bytes_ = h->shared_mem_bytes;
+    cache_layer_used_ = "compile";
+    acquire_module_ms_ = std::chrono::duration<double, std::milli>(
+        clk::now() - t0).count();
 }
 
 // Phase 3.5e — autotune sweep helpers (anonymous namespace, kept inside the
@@ -597,8 +928,10 @@ NvrtcGeneigSolver::NvrtcGeneigSolver(int n,
                                      int device_id,
                                      int batches_per_block_request,
                                      int force_block_dim_x,
-                                     TuningMode mode)
+                                     TuningMode tuning_mode,
+                                     CacheMode  cache_mode)
     : n_(n), device_id_(device_id) {
+    const TuningMode mode = tuning_mode;  // local alias preserves prior code
     CU_CHECK(cuInit(0));
     CUdevice cu_device;
     CU_CHECK(cuDeviceGet(&cu_device, device_id_));
@@ -663,7 +996,12 @@ NvrtcGeneigSolver::NvrtcGeneigSolver(int n,
             }
         }
         try {
-            compile_production_(bpb, chosen_bd_x);
+            // Phase 3.5f — final production module is acquired through the
+            // cache layer (in-process → disk → compile fallback). The
+            // autotune sweep above used the non-caching compile_production_
+            // because per-candidate cubins are throwaway. Here, the winner
+            // is a long-lived production artifact and benefits from caching.
+            acquire_module_(bpb, chosen_bd_x, cache_mode);
         } catch (const std::exception& e) {
             std::fprintf(stderr,
                 "[NvrtcGeneigSolver] BPB=%d production rejected: %s\n",
@@ -709,10 +1047,12 @@ NvrtcGeneigSolver::NvrtcGeneigSolver(int n,
 }
 
 NvrtcGeneigSolver::~NvrtcGeneigSolver() {
-    if (module_) {
-        cuModuleUnload(module_);
-        module_ = nullptr;
-    }
+    // Phase 3.5f — drop the shared_ptr. If this was the last instance
+    // referencing the CachedModule, its destructor unloads the CUmodule;
+    // otherwise the module lives on serving the next solver instance.
+    module_handle_.reset();
+    module_ = nullptr;
+    kernel_ = nullptr;
     CUdevice dev;
     if (cuDeviceGet(&dev, device_id_) == CUDA_SUCCESS) {
         cuDevicePrimaryCtxRelease(dev);

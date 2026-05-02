@@ -90,6 +90,23 @@ target_link_libraries(test_bpb_sweep_n54
         CUDA::cuda_driver
 )
 
+# Phase 3.5f — module cache benchmark and corruption recovery test.
+add_executable(test_cache_n54 test_cache_n54.cpp)
+target_link_libraries(test_cache_n54
+    PRIVATE
+        nvrtc_geneig
+        CUDA::cudart
+        CUDA::cuda_driver
+)
+
+add_executable(test_cache_invalidation test_cache_invalidation.cpp)
+target_link_libraries(test_cache_invalidation
+    PRIVATE
+        nvrtc_geneig
+        CUDA::cudart
+        CUDA::cuda_driver
+)
+
 # Phase 3.5e — autotune benchmarks at N=54 BPB=1 and N=32 BPB=2.
 add_executable(test_autotune_n54 test_autotune_n54.cpp)
 target_link_libraries(test_autotune_n54
