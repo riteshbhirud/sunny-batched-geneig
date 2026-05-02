@@ -63,6 +63,195 @@ matrix size determined at runtime by the user's magnetic unit cell.
   therefore no LTO IR cross-references into the cuSolverDx fatbin
   during nvJitLink. Per-N picked block dims on the development
   hardware: see Phase 3.5b table below.
+- **3.5d (done, this commit):** Multi-stream chunked launch path. New
+  `NvrtcGeneigSolver::launch_chunked` round-robins fixed-size chunks of
+  a larger workload across N CUDA streams (no per-chunk synchronization;
+  the CUDA scheduler is free to overlap). Free helpers `make_streams` /
+  `destroy_streams` build/teardown a `std::vector<CUstream>`. New test
+  `tests/test_streams_n54.cpp` benchmarks 30 chunks × 2000 matrices
+  (60,000 total at N=54) under stream configs {1, 2, 4, 8}, 5-sample
+  median per config, with an 8-matrix LAPACK spot-check per sample.
+  *(Note: production Sunny uses chunk_size=12000; we ran 2000 here so 30
+  chunks fit in laptop GPU memory — 360k matrices at N=54 require >50 GB
+  device memory which doesn't fit. The streaming pattern is identical;
+  per-chunk batch is what differs.)* **Result: throughput is flat across
+  all stream counts** — 1-stream median 6,861 mat/s, 8-stream median 6,911
+  mat/s (0.7% delta, well within run-to-run noise). The kernel-only
+  workload already saturates the GPU: each chunk launches 2000 blocks at
+  BlockDim<128>, far exceeding the ~50 SMs of the RTX 5070 Ti Laptop, so
+  there is no idle compute capacity for a second concurrent chunk to
+  fill. Stream-level kernel-kernel concurrency provides no measurable
+  speedup on this hardware. The win would need to come from overlapping
+  HtoD/DtoH with kernel execution (a separate API surface than
+  `launch_chunked`); deferred to a future sub-task. We ship the
+  primitive + the negative-result benchmark as documented evidence and
+  add the finding to the project's "things that look like obvious wins
+  but are not" register.
+
+  Stream config table (N=54, chunk_size=2000, total=60000, 5-sample medians):
+
+  | stream config | median mat/sec | range (min..max) | speedup vs 1S | correctness |
+  |---------------|---------------:|-----------------:|--------------:|-------------|
+  |  1-stream     |          6,861 |    6,861 .. 6,863 |        1.000x | PASS        |
+  |  2-stream     |          6,921 |    6,914 .. 6,936 |        1.009x | PASS        |
+  |  4-stream     |          6,913 |    6,912 .. 6,913 |        1.008x | PASS        |
+  |  8-stream     |          6,911 |    6,910 .. 6,912 |        1.007x | PASS        |
+
+  All configs hit fp64 epsilon: max_eig_rel = 1.61e-15, max_phase = 3.66e-15
+  on the 8 spot-check matrices per sample. Bit-equivalent results across
+  stream configs (same eig_rel and phase to displayed precision) confirm
+  the multi-stream path is correctness-equivalent to the single-stream
+  baseline.
+
+- **3.5e (done, this commit):** Empirical autotuning of BlockDim around
+  cuSolverDx's `suggested_block_dim`. New `TuningMode::Autotune` constructor
+  mode sweeps candidate BlockDim.x values around the probe-recommended
+  value, benchmarks each on a 1024-matrix synthetic workload (5-sample
+  median), validates each candidate's output against the suggested-
+  candidate reference (transitive LAPACK coverage; the suggested-mode path
+  has been LAPACK-validated end-to-end in [test_nvrtc_n54.cpp](../tests/test_nvrtc_n54.cpp)
+  and [test_nvrtc_multiN.cpp](../tests/test_nvrtc_multiN.cpp)), and picks
+  the fastest correctness-validated candidate. A process-static
+  `std::map<(N, BPB, arch), winning_BlockDim>` cache memoizes the result
+  so repeated constructions for the same `(N, BPB, arch)` skip the sweep.
+
+  **Candidate set logic** ([src/nvrtc/nvrtc_solver.cpp](../src/nvrtc/nvrtc_solver.cpp)):
+  raw set is `{suggested-64, suggested-32, suggested, suggested+32,
+  suggested+64, suggested*2}`, then filtered to:
+  - multiples of 32 (warp granularity);
+  - `> 0` and `<= 1024` (CUDA hard limit);
+  - `>= N` (so each thread handles at least one matrix-row element);
+  - dedup via `std::set<int>`, sorted ascending for readable logs.
+
+  After each candidate compiles, we additionally check that
+  `shared_memory_size <= device_max_smem_` and skip the candidate cleanly
+  if not — without this guard, `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)`
+  would crash the sweep on candidates whose cuSolverDx-reported smem fits
+  the SOLVER_SM<800> 164 KB tag budget but exceeds the consumer-laptop
+  101 KB device ceiling.
+
+  **A correctness bug found and fixed during 3.5e bring-up:** the first
+  draft of the sweep skipped recompile when `cand == suggested`, on the
+  theory that suggested was already loaded from the Phase-1 reference
+  compile. But by the time the sorted candidate loop reached suggested,
+  an earlier (smaller) candidate had already overwritten `module_` /
+  `kernel_`, so we measured that earlier candidate's kernel under the
+  suggested-row's launch config. The bug fingerprinted as two adjacent
+  rows reporting identical throughput AND identical eig_rel/phase — a
+  giveaway that the same binary was being benchmarked twice. Fix: always
+  recompile per candidate; eat the extra compile cost. Correctness is
+  non-negotiable.
+
+  **A methodology bug found and fixed during 3.5e bring-up:** the spec
+  called for a 256-matrix tuning workload, but at this hardware that's
+  too small to characterize the production regime. At 256 matrices and
+  BPB=2 we launch only 128 blocks on ~50 SMs (≈2.5 blocks/SM), and the
+  GPU is so under-occupied that BlockDim=128 wins by filling SMs while
+  the production 1024-matrix workload is large enough that BlockDim=64
+  wins on the same configuration. Bumped `kTuneB` from 256 to 1024 to
+  match the production benchmark size; characterization order now agrees
+  with production.
+
+  ### Per-candidate sweep results (sm_120 RTX 5070 Ti Laptop)
+
+  **N=54, BPB=1** (suggested=128 from probe):
+
+  | BlockDim.x | shared_mem | sweep median mat/s | range (min..max) | eig_rel  | phase    | status                              |
+  |-----------:|-----------:|-------------------:|------------------:|---------:|---------:|-------------------------------------|
+  |         64 |     97,280 |              6,286 |     6,284..6,289 | 2.11e-15 | 4.00e-15 | OK                                  |
+  |         96 |     98,176 |          **8,088** |     8,085..8,091 | 2.50e-15 | 4.88e-15 | **OK (winner)**                     |
+  |        128 |     99,712 |              6,754 |     6,735..6,755 | 0.00e+00 | 6.44e-15 | OK (= suggested)                    |
+  |        160 |    100,736 |              6,673 |     4,298..6,675 | 2.05e-15 | 3.55e-15 | OK                                  |
+  |        192 |    101,760 |                  — |                — |        — |        — | SKIP (shared_mem > 101,376 device max) |
+  |        256 |    103,808 |                  — |                — |        — |        — | SKIP (shared_mem > 101,376 device max) |
+
+  Sweep wall: 874.6 s (six full NVRTC compiles inside the sweep, plus one
+  reference compile of suggested before the sweep, plus one final compile
+  of the winner after the sweep).
+
+  **N=32, BPB=2** (suggested=64 from probe):
+
+  | BlockDim.x | shared_mem | sweep median mat/s | range (min..max) | eig_rel  | phase    | status                              |
+  |-----------:|-----------:|-------------------:|------------------:|---------:|---------:|-------------------------------------|
+  |         32 |     68,032 |             24,453 |    15,206..24,477 | 1.94e-15 | 3.55e-15 | OK                                  |
+  |         64 |     68,032 |         **46,676** |    46,400..46,691 | 0.00e+00 | 5.00e-15 | **OK (winner = suggested)**         |
+  |         96 |     69,088 |             36,186 |    30,513..36,194 | 2.22e-15 | 3.89e-15 | OK                                  |
+  |        128 |     69,600 |             40,463 |    40,298..40,466 | 2.66e-15 | 4.33e-15 | OK                                  |
+
+  Sweep wall: 114.8 s (four compiles).
+
+  ### Production-benchmark comparison (1024 random matrices)
+
+  | config             | mode      | BDx | median mat/s | range (min..max) | speedup vs sug | validation |
+  |--------------------|-----------|----:|-------------:|------------------:|---------------:|------------|
+  | N=54 BPB=1         | suggested | 128 |        6,757 |     6,703..6,758 |         1.000x | PASS       |
+  | N=54 BPB=1         | autotune  |  96 |    **8,092** |     8,089..8,094 |     **1.198x** | PASS       |
+  | N=54 BPB=1         | autotune2 |  96 |        8,095 |     8,089..8,098 |         1.198x | PASS [cache] |
+  | N=32 BPB=2         | suggested |  64 |       46,618 |    46,570..46,629 |         1.000x | PASS       |
+  | N=32 BPB=2         | autotune  |  64 |       46,592 |    46,560..46,597 |         0.999x | PASS       |
+  | N=32 BPB=2         | autotune2 |  64 |       46,593 |    44,504..46,627 |         0.999x | PASS [cache] |
+
+  ### Result and decision
+
+  **N=54 BPB=1: real 1.198× (≈20%) speedup at the production size.** The
+  autotune picks BlockDim=96 over the cuSolverDx-suggested BlockDim=128.
+  Why: cuSolverDx's heuristic takes the max across all five operators
+  (`max(chol=64, trsmL=64, trsmR=64, trsmLC=64, heev=128) = 128`). heev
+  alone wants 128, but heev is one of five stages in the unified kernel.
+  Empirically, BlockDim=96 is enough for heev's working set while leaving
+  the chol / three-trsm stages closer to their per-operator optima of
+  64 — a better global compromise than the per-operator max.
+  Correctness validates at fp64 epsilon (eig_rel=1.50e-15, phase=3.77e-15
+  on the 8-matrix LAPACK fixture). Ship it.
+
+  **N=32 BPB=2: null result.** Autotune picks BlockDim=64 = suggested.
+  Speedup 0.999× (within noise). Why: at N=32 BPB=2 the per-operator
+  recommendations are `(64, 64, 64, 64, 32)`; heev's 32 doesn't dominate
+  the max, so cuSolverDx's heuristic is already optimal for this config.
+  This is the same null-result shape as 3.5c (sync minimization) and 3.5d
+  (multi-stream concurrency at this hardware): the autotune machinery
+  proves it's harmless and adds zero risk; the win is just config-
+  dependent. Ship the infrastructure; the cached result is BlockDim=64,
+  same as the Suggested-mode default.
+
+  ### Diagnostic: why the heuristic over-shoots at N=54 but not at N=32
+
+  cuSolverDx's `suggested_block_dim` is the per-operator recommendation
+  for *that operator running alone in a kernel*. The 3b unified kernel
+  fuses five operators into one launch with a single BlockDim. Taking
+  the max across operator suggestions gives correctness (every operator
+  has at least its required threads) but not optimality, because:
+
+  - At N=32 BPB=2, four of five operators want 64 and heev wants 32. Max
+    is 64, dominated by the four-operator majority. Heuristic wins.
+  - At N=54 BPB=1, four of five operators want 64 and heev wants 128.
+    Max is 128, dominated by heev alone. The four 64-want operators run
+    at 2× their optimal thread count, and the wall-clock cost of the
+    ~four under-utilized stages outweighs heev's ~one well-utilized
+    stage. Heuristic over-shoots by 33% (96 is enough for heev given
+    sm_120's per-warp register file; the extra 32 threads are dead
+    weight to chol/trsm).
+
+  This is consistent with the Phase 3.5b N=32 micro-bench finding
+  (BlockDim=64 vs 128 is 1.153× at N=32 BPB=2 ⇒ same direction as 3.5e
+  at N=54: smaller is better than the heuristic max when heev's
+  recommendation is a minority).
+
+  ### How to use Autotune
+
+  ```cpp
+  NvrtcGeneigSolver solver(N, /*device_id=*/0,
+                            /*bpb=*/0,                    // auto-select BPB
+                            /*force_block_dim_x=*/0,      // disable forced override
+                            TuningMode::Autotune);        // run sweep
+  // first construction at this (N, BPB, arch): runs sweep (slow)
+  // subsequent constructions: cache hit (fast — only the production compile)
+  ```
+
+  Cache is process-static; survives across solver instances within the
+  same process. Persisting the autotune cache to disk is deferred to
+  Phase 3d (cubin cache).
+
 - **3c:** Per-size CUmodule cache inside `NvrtcGeneigSolver`.
   Construct once per N, reuse across all matrices.
 - **3d:** Disk-backed cubin cache, keyed on (M_SIZE, arch, library

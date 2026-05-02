@@ -90,6 +90,33 @@ target_link_libraries(test_bpb_sweep_n54
         CUDA::cuda_driver
 )
 
+# Phase 3.5e — autotune benchmarks at N=54 BPB=1 and N=32 BPB=2.
+add_executable(test_autotune_n54 test_autotune_n54.cpp)
+target_link_libraries(test_autotune_n54
+    PRIVATE
+        nvrtc_geneig
+        CUDA::cudart
+        CUDA::cuda_driver
+)
+
+add_executable(test_autotune_n32 test_autotune_n32.cpp)
+target_link_libraries(test_autotune_n32
+    PRIVATE
+        nvrtc_geneig
+        CUDA::cudart
+        CUDA::cuda_driver
+)
+
+# Phase 3.5d — multi-stream chunked launch benchmark at N=54.
+add_executable(test_streams_n54 test_streams_n54.cpp)
+target_link_libraries(test_streams_n54
+    PRIVATE
+        nvrtc_geneig
+        LAPACK::lapacke
+        CUDA::cudart
+        CUDA::cuda_driver
+)
+
 # Phase 3.5b BlockDim micro-bench at N=32, BPB=2.
 add_executable(test_blockdim_n32 test_blockdim_n32.cpp)
 target_link_libraries(test_blockdim_n32
